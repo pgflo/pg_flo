@@ -33,9 +33,9 @@ make build
 
 setup_docker
 
-log "Running e2e ddl tests..."
-if CI=false ruby ./internal/scripts/e2e_resume_test.rb; then
-  success "e2e ddl tests completed successfully"
+log "Running e2e snowflake tests..."
+if CI=false ./internal/scripts/e2e_copy_and_stream.sh; then
+  success "e2e snowflake tests completed successfully"
 else
   error "Original e2e tests failed"
   exit 1

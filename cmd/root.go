@@ -61,6 +61,12 @@ var (
 		Run:   runWorker,
 	}
 
+	snowflakeWorkerCmd = &cobra.Command{
+		Use:   "snowflake",
+		Short: "Start the worker with Snowflake sink",
+		Run:   runWorker,
+	}
+
 	webhookWorkerCmd = &cobra.Command{
 		Use:   "webhook",
 		Short: "Start the worker with webhook sink",
@@ -98,7 +104,7 @@ func init() {
 	addReplicatorFlags(replicatorCmd)
 	addWorkerFlags(workerCmd)
 
-	workerCmd.AddCommand(stdoutWorkerCmd, fileWorkerCmd, postgresWorkerCmd, webhookWorkerCmd)
+	workerCmd.AddCommand(stdoutWorkerCmd, fileWorkerCmd, postgresWorkerCmd, webhookWorkerCmd, snowflakeWorkerCmd)
 	rootCmd.AddCommand(replicatorCmd, workerCmd, versionCmd)
 
 	cobra.OnInitialize(func() {
@@ -117,6 +123,11 @@ func init() {
 				"source-host", "source-dbname", "source-user", "source-password",
 			)
 			markFlagRequired(webhookWorkerCmd, "webhook-url")
+			markFlagRequired(snowflakeWorkerCmd,
+				"snowflake-account", "snowflake-user", "snowflake-password",
+				"snowflake-warehouse", "snowflake-database", "snowflake-schema",
+				"source-host", "source-dbname", "source-user", "source-password",
+			)
 		}
 	})
 }
@@ -479,6 +490,21 @@ func createSink(sinkType string) (sinks.Sink, error) {
 		return sinks.NewWebhookSink(
 			viper.GetString("webhook-url"),
 		)
+	case "snowflake":
+		return sinks.NewSnowflakeSink(
+			viper.GetString("snowflake-account"),
+			viper.GetString("snowflake-user"),
+			viper.GetString("snowflake-password"),
+			viper.GetString("snowflake-role"),
+			viper.GetString("snowflake-warehouse"),
+			viper.GetString("snowflake-database"),
+			viper.GetString("snowflake-schema"),
+			viper.GetString("source-host"),
+			viper.GetInt("source-port"),
+			viper.GetString("source-dbname"),
+			viper.GetString("source-user"),
+			viper.GetString("source-password"),
+		)
 	default:
 		return nil, fmt.Errorf("unknown sink type: %s", sinkType)
 	}
@@ -522,4 +548,20 @@ func addWorkerFlags(cmd *cobra.Command) {
 
 	// Webhook sink specific flags
 	webhookWorkerCmd.Flags().String("webhook-url", "", "Webhook URL (env: PG_FLO_WEBHOOK_URL)")
+
+	// Snowflake sink specific flags
+	snowflakeWorkerCmd.Flags().String("snowflake-account", "", "Snowflake account (env: PG_FLO_SNOWFLAKE_ACCOUNT)")
+	snowflakeWorkerCmd.Flags().String("snowflake-user", "", "Snowflake user (env: PG_FLO_SNOWFLAKE_USER)")
+	snowflakeWorkerCmd.Flags().String("snowflake-password", "", "Snowflake password (env: PG_FLO_SNOWFLAKE_PASSWORD)")
+	snowflakeWorkerCmd.Flags().String("snowflake-role", "ACCOUNTADMIN", "Snowflake role (env: PG_FLO_SNOWFLAKE_ROLE)")
+	snowflakeWorkerCmd.Flags().String("snowflake-warehouse", "", "Snowflake warehouse (env: PG_FLO_SNOWFLAKE_WAREHOUSE)")
+	snowflakeWorkerCmd.Flags().String("snowflake-database", "", "Snowflake database (env: PG_FLO_SNOWFLAKE_DATABASE)")
+	snowflakeWorkerCmd.Flags().String("snowflake-schema", "PUBLIC", "Snowflake schema (env: PG_FLO_SNOWFLAKE_SCHEMA)")
+
+	// Add source database connection flags for Snowflake
+	snowflakeWorkerCmd.Flags().String("source-host", "", "Source PostgreSQL host (env: PG_FLO_SOURCE_HOST)")
+	snowflakeWorkerCmd.Flags().Int("source-port", 5432, "Source PostgreSQL port (env: PG_FLO_SOURCE_PORT)")
+	snowflakeWorkerCmd.Flags().String("source-dbname", "", "Source PostgreSQL database name (env: PG_FLO_SOURCE_DBNAME)")
+	snowflakeWorkerCmd.Flags().String("source-user", "", "Source PostgreSQL user (env: PG_FLO_SOURCE_USER)")
+	snowflakeWorkerCmd.Flags().String("source-password", "", "Source PostgreSQL password (env: PG_FLO_SOURCE_PASSWORD)")
 }
