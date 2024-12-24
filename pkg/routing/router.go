@@ -66,8 +66,34 @@ func (r *Router) ApplyRouting(message *utils.CDCMessage) (*utils.CDCMessage, err
 		}
 		routedMessage.Columns = newColumns
 
-		// TODO revisit this
-		if routedMessage.ReplicationKey.Type != utils.ReplicationKeyFull {
+		newData := make(map[string]interface{})
+		newOldData := make(map[string]interface{})
+		newColumnTypes := make(map[string]string)
+
+		for oldName, value := range message.Data {
+			newName := GetMappedColumnName(route.ColumnMappings, oldName)
+			if newName == "" {
+				newName = oldName
+			}
+			newData[newName] = value
+			if typeVal, exists := message.ColumnTypes[oldName]; exists {
+				newColumnTypes[newName] = typeVal
+			}
+		}
+
+		for oldName, value := range message.OldData {
+			newName := GetMappedColumnName(route.ColumnMappings, oldName)
+			if newName == "" {
+				newName = oldName
+			}
+			newOldData[newName] = value
+		}
+
+		routedMessage.Data = newData
+		routedMessage.OldData = newOldData
+		routedMessage.ColumnTypes = newColumnTypes
+
+		if routedMessage.ReplicationKey != nil && routedMessage.ReplicationKey.Type != utils.ReplicationKeyFull {
 			mappedColumns := make([]string, len(routedMessage.ReplicationKey.Columns))
 			for i, keyCol := range routedMessage.ReplicationKey.Columns {
 				mappedName := GetMappedColumnName(route.ColumnMappings, keyCol)
