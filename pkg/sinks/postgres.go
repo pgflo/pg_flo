@@ -154,7 +154,6 @@ func getWhereConditions(message *utils.CDCMessage, useOldValues bool, startingIn
 	var conditions []string
 	var values []interface{}
 	valueIndex := startingIndex
-	// log.Info().Any("message.ReplicationKey", message.ReplicationKey).Msg("getWhereConditions")
 	switch message.ReplicationKey.Type {
 	case utils.ReplicationKeyFull:
 		// For FULL, use all non-null values
@@ -241,14 +240,6 @@ func (s *PostgresSink) handleUpdate(tx pgx.Tx, message *utils.CDCMessage) error 
 
 	// Iterate over Data map directly
 	for colName, value := range message.Data {
-		// // Skip toasted columns only if they're marked as toasted AND null
-		// if message.IsColumnToasted(colName) && value == nil {
-		// 	s.logger.Debug().
-		// 		Str("column", colName).
-		// 		Msg("Skipping toasted column")
-		// 	continue
-		// }
-
 		if value == nil {
 			setClauses = append(setClauses, fmt.Sprintf("%s = NULL", colName))
 		} else {

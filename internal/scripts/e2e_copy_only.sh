@@ -88,6 +88,7 @@ start_pg_flo_worker() {
     --target-dbname "$TARGET_PG_DB" \
     --target-user "$TARGET_PG_USER" \
     --target-password "$TARGET_PG_PASSWORD" \
+    --batch-size 5000 \
     --target-sync-schema \
     >"$pg_flo_WORKER_LOG" 2>&1 &
   pg_flo_WORKER_PID=$!
