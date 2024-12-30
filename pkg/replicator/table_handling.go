@@ -10,10 +10,17 @@ import (
 // AddPrimaryKeyInfo adds replication key information to the CDCMessage
 func (r *BaseReplicator) AddPrimaryKeyInfo(message *utils.CDCMessage, table string) {
 	if key, ok := r.TableReplicationKeys[table]; ok {
-		message.ReplicationKey = key
+		replicationKey := key
+		message.ReplicationKey = &replicationKey
 	} else {
 		r.Logger.Error().
 			Str("table", table).
+			Any("message", message.Data).
+			Any("schema", message.Schema).
+			Any("table", message.Table).
+			Any("operation", message.Operation).
+			Any("lsn", message.LSN).
+			Any("emitted_at", message.EmittedAt).
 			Msg("No replication key information found for table. This should not happen as validation is done during initialization")
 	}
 }

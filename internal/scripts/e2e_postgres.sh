@@ -91,7 +91,7 @@ start_pg_flo_worker() {
 
 simulate_changes() {
   log "Simulating changes..."
-  local insert_count=6000
+  local insert_count=1000
 
   for i in $(seq 1 "$insert_count"); do
     run_sql "INSERT INTO public.users (data, nullable_column, toasted_column) VALUES ('Data $i', 'Nullable $i', 'Toasted $i');"

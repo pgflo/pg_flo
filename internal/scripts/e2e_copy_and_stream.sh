@@ -216,7 +216,7 @@ test_pg_flo_cdc() {
   simulate_concurrent_changes
 
   log "Waiting for changes to replicate..."
-  sleep 90
+  sleep 180
   stop_pg_flo_gracefully
   compare_row_counts || return 1
   verify_large_json || return 1

@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   postgres:
-    image: postgres:14
+    image: debezium/postgres:14-alpine
     container_name: pg_logical_replication
     environment:
       POSTGRES_USER: myuser
@@ -23,7 +23,7 @@ services:
     restart: unless-stopped
 
   target_postgres:
-    image: postgres:14
+    image: postgres:14-alpine
     container_name: pg_target
     environment:
       POSTGRES_USER: targetuser

@@ -2,7 +2,9 @@ package replicator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -153,19 +155,29 @@ func (r *BaseReplicator) checkPublicationExists(publicationName string) (bool, e
 // StartReplicationFromLSN initiates the replication process from a given LSN
 func (r *BaseReplicator) StartReplicationFromLSN(ctx context.Context, startLSN pglogrepl.LSN, stopChan <-chan struct{}) error {
 	publicationName := GeneratePublicationName(r.Config.Group)
-	r.Logger.Info().Str("startLSN", startLSN.String()).Str("publication", publicationName).Msg("Starting replication")
 
-	err := r.ReplicationConn.StartReplication(ctx, publicationName, startLSN, pglogrepl.StartReplicationOptions{
+	tables, err := r.GetConfiguredTables(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get configured tables: %w", err)
+	}
+
+	tableList := strings.Join(tables, ",")
+
+	err = r.ReplicationConn.StartReplication(ctx, publicationName, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{
-			"proto_version '1'",
-			fmt.Sprintf("publication_names '%s'", publicationName),
+			"\"pretty-print\" 'true'",
+			"\"include-types\" 'true'",
+			"\"include-timestamp\" 'true'",
+			"\"include-pk\" 'true'",
+			"\"format-version\" '2'",
+			"\"include-column-positions\" 'true'",
+			"\"actions\" 'insert,update,delete'",
+			fmt.Sprintf("\"add-tables\" '%s'", tableList),
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start replication: %w", err)
 	}
-
-	r.Logger.Info().Str("startLSN", startLSN.String()).Msg("Replication started successfully")
 
 	return r.StreamChanges(ctx, stopChan)
 }
@@ -281,136 +293,102 @@ func (r *BaseReplicator) handlePrimaryKeepaliveMessage(ctx context.Context, data
 	return nil
 }
 
-// processWALData handles different types of WAL messages
+// processWALData processes the WAL data from wal2json
 func (r *BaseReplicator) processWALData(walData []byte, lsn pglogrepl.LSN) error {
-	logicalMsg, err := pglogrepl.Parse(walData)
-	if err != nil {
-		return fmt.Errorf("failed to parse WAL data: %w", err)
+
+	var msg utils.Wal2JsonMessage
+	if err := json.Unmarshal(walData, &msg); err != nil {
+		return fmt.Errorf("failed to parse wal2json message: %w", err)
 	}
 
-	switch msg := logicalMsg.(type) {
-	case *pglogrepl.RelationMessage:
-		r.handleRelationMessage(msg)
-	case *pglogrepl.BeginMessage:
-		return r.HandleBeginMessage(msg)
-	case *pglogrepl.InsertMessage:
-		return r.HandleInsertMessage(msg, lsn)
-	case *pglogrepl.UpdateMessage:
-		return r.HandleUpdateMessage(msg, lsn)
-	case *pglogrepl.DeleteMessage:
-		return r.HandleDeleteMessage(msg, lsn)
-	case *pglogrepl.CommitMessage:
-		return r.HandleCommitMessage(msg)
-	default:
-		r.Logger.Warn().Type("message", msg).Msg("Received unexpected logical replication message")
-	}
+	switch msg.Action {
+	case "B": // Begin
+		r.mu.Lock()
+		r.currentTxBuffer = make([]utils.CDCMessage, 0)
+		r.mu.Unlock()
+		return nil
 
-	return nil
-}
+	case "C": // Commit
+		r.mu.Lock()
+		defer r.mu.Unlock()
 
-// handleRelationMessage handles RelationMessage messages
-func (r *BaseReplicator) handleRelationMessage(msg *pglogrepl.RelationMessage) {
-	r.Relations[msg.RelationID] = msg
-	r.Logger.Info().Str("table", msg.RelationName).Uint32("id", msg.RelationID).Msg("Relation message received")
-}
-
-// HandleBeginMessage handles BeginMessage messages
-func (r *BaseReplicator) HandleBeginMessage(msg *pglogrepl.BeginMessage) error {
-	r.currentTxBuffer = make([]utils.CDCMessage, 0)
-	r.currentTxLSN = msg.FinalLSN
-	return nil
-}
-
-// HandleInsertMessage handles InsertMessage messages
-func (r *BaseReplicator) HandleInsertMessage(msg *pglogrepl.InsertMessage, lsn pglogrepl.LSN) error {
-	relation, ok := r.Relations[msg.RelationID]
-	if !ok {
-		return fmt.Errorf("unknown relation ID: %d", msg.RelationID)
-	}
-
-	cdcMessage := utils.CDCMessage{
-		Type:      utils.OperationInsert,
-		Schema:    relation.Namespace,
-		Table:     relation.RelationName,
-		Columns:   relation.Columns,
-		EmittedAt: time.Now(),
-		NewTuple:  msg.Tuple,
-		LSN:       lsn.String(),
-	}
-
-	r.AddPrimaryKeyInfo(&cdcMessage, relation.RelationName)
-	r.currentTxBuffer = append(r.currentTxBuffer, cdcMessage)
-	return nil
-}
-
-// HandleUpdateMessage handles UpdateMessage messages
-func (r *BaseReplicator) HandleUpdateMessage(msg *pglogrepl.UpdateMessage, lsn pglogrepl.LSN) error {
-	relation, ok := r.Relations[msg.RelationID]
-	if !ok {
-		return fmt.Errorf("unknown relation ID: %d", msg.RelationID)
-	}
-
-	cdcMessage := utils.CDCMessage{
-		Type:           utils.OperationUpdate,
-		Schema:         relation.Namespace,
-		Table:          relation.RelationName,
-		Columns:        relation.Columns,
-		NewTuple:       msg.NewTuple,
-		OldTuple:       msg.OldTuple,
-		LSN:            lsn.String(),
-		EmittedAt:      time.Now(),
-		ToastedColumns: make(map[string]bool),
-	}
-
-	for i, col := range relation.Columns {
-		if msg.NewTuple != nil {
-			newVal := msg.NewTuple.Columns[i]
-			cdcMessage.ToastedColumns[col.Name] = newVal.DataType == 'u'
+		for _, cdcMsg := range r.currentTxBuffer {
+			if err := r.PublishToNATS(cdcMsg); err != nil {
+				return fmt.Errorf("failed to publish message: %w", err)
+			}
 		}
-	}
 
-	r.AddPrimaryKeyInfo(&cdcMessage, relation.RelationName)
-	r.currentTxBuffer = append(r.currentTxBuffer, cdcMessage)
-	return nil
-}
+		r.currentTxBuffer = nil
+		r.LastLSN = lsn
+		return r.SaveState(lsn)
 
-// HandleDeleteMessage handles DeleteMessage messages
-func (r *BaseReplicator) HandleDeleteMessage(msg *pglogrepl.DeleteMessage, lsn pglogrepl.LSN) error {
-	relation, ok := r.Relations[msg.RelationID]
-	if !ok {
-		return fmt.Errorf("unknown relation ID: %d", msg.RelationID)
-	}
-
-	cdcMessage := utils.CDCMessage{
-		Type:      utils.OperationDelete,
-		Schema:    relation.Namespace,
-		Table:     relation.RelationName,
-		Columns:   relation.Columns,
-		OldTuple:  msg.OldTuple,
-		EmittedAt: time.Now(),
-		LSN:       lsn.String(),
-	}
-
-	r.AddPrimaryKeyInfo(&cdcMessage, relation.RelationName)
-	r.currentTxBuffer = append(r.currentTxBuffer, cdcMessage)
-	return nil
-}
-
-// HandleCommitMessage processes a commit message and publishes it to NATS
-func (r *BaseReplicator) HandleCommitMessage(msg *pglogrepl.CommitMessage) error {
-	for _, cdcMessage := range r.currentTxBuffer {
-		if err := r.PublishToNATS(cdcMessage); err != nil {
-			return fmt.Errorf("failed to publish message: %w", err)
+	case "I", "U", "D": // Insert, Update, Delete
+		cdcMsg := &utils.CDCMessage{
+			Schema:      msg.Schema,
+			Table:       msg.Table,
+			LSN:         lsn.String(),
+			EmittedAt:   time.Now(),
+			Data:        make(map[string]interface{}),
+			OldData:     make(map[string]interface{}),
+			ColumnTypes: make(map[string]string),
+			Columns:     make([]utils.Column, len(msg.Columns)),
 		}
+
+		switch msg.Action {
+		case "I":
+			cdcMsg.Operation = utils.OperationInsert
+		case "U":
+			cdcMsg.Operation = utils.OperationUpdate
+		case "D":
+			cdcMsg.Operation = utils.OperationDelete
+		}
+
+		r.AddPrimaryKeyInfo(cdcMsg, msg.Table)
+
+		for i, col := range msg.Columns {
+			value := col.Value
+
+			// TODO: is this working? do we need to merge this with convert function
+			if col.Type == "bigint" && col.Value != nil {
+				if strVal, ok := col.Value.(string); ok {
+					if parsed, err := strconv.ParseInt(strVal, 10, 64); err == nil {
+						value = parsed
+					}
+				}
+			}
+
+			cdcMsg.Data[col.Name] = value
+			cdcMsg.ColumnTypes[col.Name] = col.Type
+			cdcMsg.Columns[i] = utils.Column{
+				Name:     col.Name,
+				DataType: utils.GetOIDFromTypeName(col.Type),
+			}
+		}
+
+		// Process old values from identity field
+		if len(msg.Identity) > 0 {
+			for _, col := range msg.Identity {
+				value := col.Value
+
+				// Handle bigint values for old data too
+				if col.Type == "bigint" && col.Value != nil {
+					if strVal, ok := col.Value.(string); ok {
+						if parsed, err := strconv.ParseInt(strVal, 10, 64); err == nil {
+							value = parsed
+						}
+					}
+				}
+
+				cdcMsg.OldData[col.Name] = value
+			}
+		}
+
+		r.mu.Lock()
+		r.currentTxBuffer = append(r.currentTxBuffer, *cdcMsg)
+		r.mu.Unlock()
+
 	}
 
-	r.LastLSN = msg.CommitLSN
-	if err := r.SaveState(msg.CommitLSN); err != nil {
-		r.Logger.Error().Err(err).Msg("Failed to save replication state")
-		return err
-	}
-
-	r.currentTxBuffer = nil
 	return nil
 }
 
@@ -422,6 +400,7 @@ func (r *BaseReplicator) PublishToNATS(data utils.CDCMessage) error {
 	}
 
 	subject := fmt.Sprintf("pgflo.%s", r.Config.Group)
+
 	err = r.NATSClient.PublishMessage(subject, binaryData)
 	if err != nil {
 		r.Logger.Error().

@@ -84,12 +84,7 @@ func (s *FileSink) WriteBatch(messages []*utils.CDCMessage) error {
 	defer s.mutex.Unlock()
 
 	for _, message := range messages {
-		decodedMessage, err := buildDecodedMessage(message)
-		if err != nil {
-			return fmt.Errorf("failed to build decoded message: %v", err)
-		}
-
-		jsonData, err := json.Marshal(decodedMessage)
+		jsonData, err := json.Marshal(message)
 		if err != nil {
 			return fmt.Errorf("failed to marshal data to JSON: %v", err)
 		}

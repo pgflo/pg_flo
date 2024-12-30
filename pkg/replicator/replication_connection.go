@@ -54,7 +54,9 @@ func (rc *PostgresReplicationConnection) Close(ctx context.Context) error {
 
 // CreateReplicationSlot creates a new replication slot in the PostgreSQL database.
 func (rc *PostgresReplicationConnection) CreateReplicationSlot(ctx context.Context, slotName string) (pglogrepl.CreateReplicationSlotResult, error) {
-	return pglogrepl.CreateReplicationSlot(ctx, rc.Conn, slotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
+	return pglogrepl.CreateReplicationSlot(ctx, rc.Conn, slotName, "wal2json", pglogrepl.CreateReplicationSlotOptions{
+		Temporary: false,
+	})
 }
 
 // StartReplication initiates the replication process from the specified LSN.

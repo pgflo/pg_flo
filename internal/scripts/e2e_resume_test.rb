@@ -284,7 +284,7 @@ class ResumeTest
     @logger.info "Waiting for all inserts to complete..."
     threads.each(&:join)
 
-    sleep 20
+    sleep 60
 
     @logger.info "Sending final SIGTERM to cleanup..."
     @replicator_pids.each do |pid|

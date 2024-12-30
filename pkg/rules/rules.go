@@ -1,15 +1,13 @@
 package rules
 
 import (
+	"encoding/json"
 	"fmt"
-	"reflect"
 	"regexp"
 	"strings"
-	"time"
 
 	"os"
 
-	"github.com/jackc/pgtype"
 	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
@@ -109,7 +107,7 @@ func NewMaskTransformRule(table, column string, params map[string]interface{}) (
 	}
 
 	transform := func(m *utils.CDCMessage) (*utils.CDCMessage, error) {
-		useOldValues := m.Type == utils.OperationDelete
+		useOldValues := m.Operation == utils.OperationDelete
 		value, err := m.GetColumnValue(column, useOldValues)
 		if err != nil {
 			return m, nil
@@ -180,80 +178,103 @@ func NewFilterRule(table, column string, params map[string]interface{}) (Rule, e
 // NewComparisonCondition creates a new comparison condition function
 func NewComparisonCondition(column, operator string, value interface{}) func(*utils.CDCMessage) bool {
 	return func(m *utils.CDCMessage) bool {
-		useOldValues := m.Type == utils.OperationDelete
+		useOldValues := m.Operation == utils.OperationDelete
 		columnValue, err := m.GetColumnValue(column, useOldValues)
 		if err != nil {
 			return false
 		}
 
-		colIndex := m.GetColumnIndex(column)
-		if colIndex == -1 {
+		var colVal, compareVal decimal.Decimal
+
+		// Handle column value from JSON
+		switch v := columnValue.(type) {
+		case float64:
+			colVal = decimal.NewFromFloat(v)
+			logger.Debug().
+				Float64("value", v).
+				Str("column", column).
+				Msg("Converting float64")
+		case json.Number:
+			var err error
+			colVal, err = decimal.NewFromString(v.String())
+			if err != nil {
+				logger.Debug().
+					Err(err).
+					Str("value", v.String()).
+					Str("column", column).
+					Msg("Failed to parse json.Number")
+				return false
+			}
+			logger.Debug().
+				Str("value", v.String()).
+				Str("column", column).
+				Msg("Converting json.Number")
+		case int64:
+			colVal = decimal.NewFromInt(v)
+			logger.Debug().
+				Int64("value", v).
+				Str("column", column).
+				Msg("Converting int64")
+		case int:
+			colVal = decimal.NewFromInt(int64(v))
+			logger.Debug().
+				Int("value", v).
+				Str("column", column).
+				Msg("Converting int")
+		case string:
+			// Handle numeric strings (sometimes wal2json sends these)
+			var err error
+			colVal, err = decimal.NewFromString(v)
+			if err != nil {
+				logger.Debug().
+					Err(err).
+					Str("value", v).
+					Str("column", column).
+					Msg("Failed to parse numeric string")
+				return false
+			}
+			logger.Debug().
+				Str("value", v).
+				Str("column", column).
+				Msg("Converting numeric string")
+		default:
+			logger.Debug().
+				Str("type", fmt.Sprintf("%T", v)).
+				Any("value", v).
+				Str("column", column).
+				Msg("Unsupported numeric type")
 			return false
 		}
 
-		columnType := m.Columns[colIndex].DataType
-
-		switch columnType {
-		case pgtype.Int2OID, pgtype.Int4OID, pgtype.Int8OID:
-			intVal, ok := utils.ToInt64(columnValue)
-			if !ok {
-				return false
-			}
-			compareVal, ok := utils.ToInt64(value)
-			if !ok {
-				return false
-			}
-			return compareValues(intVal, compareVal, operator)
-		case pgtype.Float4OID, pgtype.Float8OID:
-			floatVal, ok := utils.ToFloat64(columnValue)
-			if !ok {
-				return false
-			}
-			compareVal, ok := utils.ToFloat64(value)
-			if !ok {
-				return false
-			}
-			return compareValues(floatVal, compareVal, operator)
-		case pgtype.TextOID, pgtype.VarcharOID:
-			strVal, ok := columnValue.(string)
-			if !ok {
-				return false
-			}
-			compareVal, ok := value.(string)
-			if !ok {
-				return false
-			}
-			return compareValues(strVal, compareVal, operator)
-		case pgtype.TimestampOID, pgtype.TimestamptzOID:
-			timeVal, ok := columnValue.(time.Time)
-			if !ok {
-				return false
-			}
-			compareVal, err := utils.ParseTimestamp(fmt.Sprintf("%v", value))
+		// Handle comparison value from YAML
+		switch v := value.(type) {
+		case float64:
+			compareVal = decimal.NewFromFloat(v)
+		case json.Number:
+			var err error
+			compareVal, err = decimal.NewFromString(v.String())
 			if err != nil {
 				return false
 			}
-			return compareValues(timeVal.UTC(), compareVal.UTC(), operator)
-		case pgtype.BoolOID:
-			boolVal, ok := utils.ToBool(columnValue)
-			if !ok {
-				return false
-			}
-			compareVal, ok := value.(bool)
-			if !ok {
-				return false
-			}
-			return compareValues(boolVal, compareVal, operator)
-		case pgtype.NumericOID:
-			numVal, ok := columnValue.(string)
-			if !ok {
-				return false
-			}
-			compareVal, ok := value.(string)
-			if !ok {
-				return false
-			}
-			return compareNumericValues(numVal, compareVal, operator)
+		case int:
+			compareVal = decimal.NewFromInt(int64(v))
+		default:
+			return false
+		}
+
+		switch operator {
+		case "eq":
+			return colVal.Equal(compareVal)
+		case "ne":
+			return !colVal.Equal(compareVal)
+		case "gt":
+			return colVal.GreaterThan(compareVal)
+		case "lt":
+			return colVal.LessThan(compareVal)
+		case "gte":
+			return colVal.GreaterThanOrEqual(compareVal)
+		case "lte":
+			return colVal.LessThanOrEqual(compareVal)
 		default:
 			return false
 		}
@@ -263,7 +284,7 @@ func NewComparisonCondition(column, operator string, value interface{}) func(*ut
 // NewContainsCondition creates a new contains condition function
 func NewContainsCondition(column string, value interface{}) func(*utils.CDCMessage) bool {
 	return func(m *utils.CDCMessage) bool {
-		useOldValues := m.Type == utils.OperationDelete
+		useOldValues := m.Operation == utils.OperationDelete
 		columnValue, err := m.GetColumnValue(column, useOldValues)
 		if err != nil {
 			return false
@@ -280,91 +301,14 @@ func NewContainsCondition(column string, value interface{}) func(*utils.CDCMessa
 	}
 }
 
-// compareValues compares two values based on the provided operator
-func compareValues(a, b interface{}, operator string) bool {
-	switch operator {
-	case "eq":
-		return reflect.DeepEqual(a, b)
-	case "ne":
-		return !reflect.DeepEqual(a, b)
-	case "gt":
-		return compareGreaterThan(a, b)
-	case "lt":
-		return compareLessThan(a, b)
-	case "gte":
-		return compareGreaterThan(a, b) || reflect.DeepEqual(a, b)
-	case "lte":
-		return compareLessThan(a, b) || reflect.DeepEqual(a, b)
-	}
-	return false
-}
-
-// compareGreaterThan checks if 'a' is greater than 'b'
-func compareGreaterThan(a, b interface{}) bool {
-	switch a := a.(type) {
-	case int64:
-		return a > b.(int64)
-	case float64:
-		return a > b.(float64)
-	case string:
-		return a > b.(string)
-	case time.Time:
-		return a.After(b.(time.Time))
-	default:
-		return false
-	}
-}
-
-// compareLessThan checks if 'a' is less than 'b'
-func compareLessThan(a, b interface{}) bool {
-	switch a := a.(type) {
-	case int64:
-		return a < b.(int64)
-	case float64:
-		return a < b.(float64)
-	case string:
-		return a < b.(string)
-	case time.Time:
-		return a.Before(b.(time.Time))
-	default:
-		return false
-	}
-}
-
-// compareNumericValues compares two numeric values based on the provided operator
-func compareNumericValues(a, b string, operator string) bool {
-	aNum, err1 := decimal.NewFromString(a)
-	bNum, err2 := decimal.NewFromString(b)
-	if err1 != nil || err2 != nil {
-		return false
-	}
-
-	switch operator {
-	case "eq":
-		return aNum.Equal(bNum)
-	case "ne":
-		return !aNum.Equal(bNum)
-	case "gt":
-		return aNum.GreaterThan(bNum)
-	case "lt":
-		return aNum.LessThan(bNum)
-	case "gte":
-		return aNum.GreaterThanOrEqual(bNum)
-	case "lte":
-		return aNum.LessThanOrEqual(bNum)
-	default:
-		return false
-	}
-}
-
 // Apply applies the transform rule to the provided data
 func (r *TransformRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error) {
-	if !containsOperation(r.Operations, message.Type) {
+	if !containsOperation(r.Operations, message.Operation) {
 		return message, nil
 	}
 
 	// Don't apply rule if asked not to
-	if message.Type == utils.OperationDelete && r.AllowEmptyDeletes {
+	if message.Operation == utils.OperationDelete && r.AllowEmptyDeletes {
 		return message, nil
 	}
 
@@ -373,12 +317,13 @@ func (r *TransformRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, err
 
 // Apply applies the filter rule to the provided data
 func (r *FilterRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error) {
-	if !containsOperation(r.Operations, message.Type) {
+
+	if !containsOperation(r.Operations, message.Operation) {
 		return message, nil
 	}
 
 	// Don't apply rule if asked not to
-	if message.Type == utils.OperationDelete && r.AllowEmptyDeletes {
+	if message.Operation == utils.OperationDelete && r.AllowEmptyDeletes {
 		return message, nil
 	}
 
@@ -386,7 +331,7 @@ func (r *FilterRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error)
 
 	logger.Debug().
 		Str("column", r.ColumnName).
-		Any("operation", message.Type).
+		Any("operation", message.Operation).
 		Bool("passes", passes).
 		Bool("allowEmptyDeletes", r.AllowEmptyDeletes).
 		Msg("Filter condition result")

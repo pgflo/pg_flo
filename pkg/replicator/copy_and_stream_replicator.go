@@ -214,8 +214,8 @@ func (r *CopyAndStreamReplicator) CopyTableRange(ctx context.Context, tableName 
 		}
 	}()
 
-	if setSnapshotErr := r.setTransactionSnapshot(tx, snapshotID); setSnapshotErr != nil {
-		return 0, setSnapshotErr
+	if err := r.setTransactionSnapshot(tx, snapshotID); err != nil {
+		return 0, err
 	}
 
 	schema, err := r.getSchemaName(tx, tableName)
@@ -224,7 +224,73 @@ func (r *CopyAndStreamReplicator) CopyTableRange(ctx context.Context, tableName 
 	}
 
 	query := r.buildCopyQuery(tableName, startPage, endPage)
-	return r.executeCopyQuery(ctx, tx, query, schema, tableName, workerID)
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("failed to execute copy query: %v", err)
+	}
+	defer rows.Close()
+
+	fieldDescriptions := rows.FieldDescriptions()
+	columnTypes := make(map[string]uint32)
+	columnNames := make([]string, len(fieldDescriptions))
+
+	for i, fd := range fieldDescriptions {
+		columnNames[i] = fd.Name
+		columnTypes[fd.Name] = fd.DataTypeOID
+	}
+
+	var copyCount int64
+	for rows.Next() {
+		values, err := rows.Values()
+		if err != nil {
+			return 0, fmt.Errorf("error reading row: %v", err)
+		}
+
+		data := make(map[string]interface{})
+		for i, value := range values {
+			if value != nil {
+				convertedValue, err := utils.ConvertToPgCompatibleOutput(value, columnTypes[columnNames[i]])
+				if err != nil {
+					return 0, fmt.Errorf("error converting value: %v", err)
+				}
+				data[columnNames[i]] = convertedValue
+			} else {
+				data[columnNames[i]] = nil
+			}
+		}
+
+		cdcMessage := utils.CDCMessage{
+			Operation: utils.OperationInsert,
+			Schema:    schema,
+			Table:     tableName,
+			Data:      data,
+			LSN:       r.LastLSN.String(),
+			EmittedAt: time.Now(),
+			Columns:   make([]utils.Column, len(fieldDescriptions)),
+		}
+
+		for i, fd := range fieldDescriptions {
+			cdcMessage.Columns[i] = utils.Column{
+				Name:     fd.Name,
+				DataType: fd.DataTypeOID,
+			}
+		}
+
+		r.AddPrimaryKeyInfo(&cdcMessage, tableName)
+		if err := r.PublishToNATS(cdcMessage); err != nil {
+			return 0, fmt.Errorf("failed to publish message: %v", err)
+		}
+
+		copyCount++
+
+		select {
+		case <-ctx.Done():
+			return copyCount, ctx.Err()
+		default:
+		}
+	}
+
+	return copyCount, rows.Err()
 }
 
 // setTransactionSnapshot sets the transaction snapshot.
@@ -254,77 +320,6 @@ func (r *CopyAndStreamReplicator) buildCopyQuery(tableName string, startPage, en
 			WHERE ctid >= '(%d,0)'::tid AND ctid < '(%d,0)'::tid`,
 		pgx.Identifier{tableName}.Sanitize(), startPage, endPage)
 	return query
-}
-
-// executeCopyQuery executes the copy query and publishes the results to NATS.
-func (r *CopyAndStreamReplicator) executeCopyQuery(ctx context.Context, tx pgx.Tx, query, schema, tableName string, workerID int) (int64, error) {
-	r.Logger.Debug().Str("copyQuery", query).Int("workerID", workerID).Msg("Executing initial copy query")
-
-	rows, err := tx.Query(context.Background(), query)
-	if err != nil {
-		return 0, fmt.Errorf("failed to execute initial copy query: %v", err)
-	}
-	defer rows.Close()
-
-	fieldDescriptions := rows.FieldDescriptions()
-	columns := make([]*pglogrepl.RelationMessageColumn, len(fieldDescriptions))
-	for i, fd := range fieldDescriptions {
-		columns[i] = &pglogrepl.RelationMessageColumn{
-			Name:     fd.Name,
-			DataType: fd.DataTypeOID,
-		}
-	}
-
-	var copyCount int64
-	for rows.Next() {
-		values, err := rows.Values()
-		if err != nil {
-			return 0, fmt.Errorf("error reading row: %v", err)
-		}
-
-		tupleData := &pglogrepl.TupleData{
-			Columns: make([]*pglogrepl.TupleDataColumn, len(values)),
-		}
-		for i, value := range values {
-			data, err := utils.ConvertToPgCompatibleOutput(value, fieldDescriptions[i].DataTypeOID)
-			if err != nil {
-				return 0, fmt.Errorf("error converting value: %v", err)
-			}
-
-			tupleData.Columns[i] = &pglogrepl.TupleDataColumn{
-				DataType: uint8(fieldDescriptions[i].DataTypeOID),
-				Data:     data,
-			}
-		}
-
-		cdcMessage := utils.CDCMessage{
-			Type:      utils.OperationInsert,
-			Schema:    schema,
-			Table:     tableName,
-			Columns:   columns,
-			NewTuple:  tupleData,
-			EmittedAt: time.Now(),
-		}
-
-		r.BaseReplicator.AddPrimaryKeyInfo(&cdcMessage, tableName)
-		if err := r.BaseReplicator.PublishToNATS(cdcMessage); err != nil {
-			return 0, fmt.Errorf("failed to publish insert event to NATS: %v", err)
-		}
-
-		copyCount++
-
-		select {
-		case <-ctx.Done():
-			return copyCount, ctx.Err()
-		default:
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("error during row iteration: %v", err)
-	}
-
-	return copyCount, nil
 }
 
 // collectErrors collects errors from the error channel and returns them as a single error.

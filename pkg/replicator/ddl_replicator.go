@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pglogrepl"
-	"github.com/jackc/pgtype"
 	"github.com/pgflo/pg_flo/pkg/utils"
 )
 
@@ -179,25 +177,16 @@ func (d *DDLReplicator) ProcessDDLEvents(ctx context.Context) error {
 		}
 
 		cdcMessage := utils.CDCMessage{
-			Type:      utils.OperationDDL,
+			Operation: utils.OperationDDL,
 			Schema:    schema,
 			Table:     table,
 			EmittedAt: time.Now(),
-			Columns: []*pglogrepl.RelationMessageColumn{
-				{Name: "event_type", DataType: pgtype.TextOID},
-				{Name: "object_type", DataType: pgtype.TextOID},
-				{Name: "object_identity", DataType: pgtype.TextOID},
-				{Name: "ddl_command", DataType: pgtype.TextOID},
-				{Name: "created_at", DataType: pgtype.TimestamptzOID},
-			},
-			NewTuple: &pglogrepl.TupleData{
-				Columns: []*pglogrepl.TupleDataColumn{
-					{Data: []byte(eventType)},
-					{Data: []byte(objectType)},
-					{Data: []byte(objectIdentity)},
-					{Data: []byte(ddlCommand)},
-					{Data: []byte(createdAt.Format(time.RFC3339))},
-				},
+			Data: map[string]interface{}{
+				"event_type":      eventType,
+				"object_type":     objectType,
+				"object_identity": objectIdentity,
+				"ddl_command":     ddlCommand,
+				"created_at":      createdAt.Format(time.RFC3339),
 			},
 		}
 

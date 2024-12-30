@@ -3,7 +3,6 @@ package routing
 import (
 	"sync"
 
-	"github.com/jackc/pglogrepl"
 	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -48,7 +47,7 @@ func (r *Router) ApplyRouting(message *utils.CDCMessage) (*utils.CDCMessage, err
 		return message, nil
 	}
 
-	if !ContainsOperation(route.Operations, message.Type) {
+	if !ContainsOperation(route.Operations, message.Operation) {
 		return nil, nil
 	}
 
@@ -56,18 +55,45 @@ func (r *Router) ApplyRouting(message *utils.CDCMessage) (*utils.CDCMessage, err
 	routedMessage.Table = route.DestinationTable
 
 	if len(route.ColumnMappings) > 0 {
-		newColumns := make([]*pglogrepl.RelationMessageColumn, len(message.Columns))
+		newColumns := make([]utils.Column, len(message.Columns))
 		for i, col := range message.Columns {
-			newCol := *col
+			newCol := col
 			mappedName := GetMappedColumnName(route.ColumnMappings, col.Name)
 			if mappedName != "" {
 				newCol.Name = mappedName
 			}
-			newColumns[i] = &newCol
+			newColumns[i] = newCol
 		}
 		routedMessage.Columns = newColumns
 
-		if routedMessage.ReplicationKey.Type != utils.ReplicationKeyFull {
+		newData := make(map[string]interface{})
+		newOldData := make(map[string]interface{})
+		newColumnTypes := make(map[string]string)
+
+		for oldName, value := range message.Data {
+			newName := GetMappedColumnName(route.ColumnMappings, oldName)
+			if newName == "" {
+				newName = oldName
+			}
+			newData[newName] = value
+			if typeVal, exists := message.ColumnTypes[oldName]; exists {
+				newColumnTypes[newName] = typeVal
+			}
+		}
+
+		for oldName, value := range message.OldData {
+			newName := GetMappedColumnName(route.ColumnMappings, oldName)
+			if newName == "" {
+				newName = oldName
+			}
+			newOldData[newName] = value
+		}
+
+		routedMessage.Data = newData
+		routedMessage.OldData = newOldData
+		routedMessage.ColumnTypes = newColumnTypes
+
+		if routedMessage.ReplicationKey != nil && routedMessage.ReplicationKey.Type != utils.ReplicationKeyFull {
 			mappedColumns := make([]string, len(routedMessage.ReplicationKey.Columns))
 			for i, keyCol := range routedMessage.ReplicationKey.Columns {
 				mappedName := GetMappedColumnName(route.ColumnMappings, keyCol)

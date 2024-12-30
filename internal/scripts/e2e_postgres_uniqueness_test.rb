@@ -4,6 +4,7 @@ require 'pg'
 require 'logger'
 require 'securerandom'
 require 'json'
+require 'digest'
 
 class PostgresUniquenessTest
   # Database configuration
@@ -200,16 +201,18 @@ target-sync-schema: true
     @logger.info "Testing operations on unique_test..."
     uuid = SecureRandom.uuid
 
-    # Test INSERT
+    logo_path = "internal/pg_flo_logo.png"
+    binary_data = File.binread(logo_path).force_encoding('BINARY')
+
     @source_db.exec_params(
       "INSERT INTO public.unique_test (unique_col, binary_data, interval_data, data)
-       VALUES ($1, $2, $3, $4)",
-      [uuid, '\xdeadbeef', '1 year 2 months 3 days', '{"value": "test"}']
+       VALUES ($1, $2::bytea, $3, $4)",
+      [uuid, { value: binary_data, format: 1 }, '1 year 2 months 3 days', '{"value": "test"}']
     )
 
     sleep 1
     verify_table_data("unique_test", "unique_col = '#{uuid}'",
-      "1 | #{uuid} | \\xdeadbeef | 1 year 2 mons 3 days | {\"value\": \"test\"}")
+      "1 | #{uuid} | #{Digest::MD5.hexdigest(binary_data)} | 1 year 2 mons 3 days | {\"value\": \"test\"}")
 
     # Test UPDATE
     @source_db.exec_params(
@@ -219,8 +222,7 @@ target-sync-schema: true
 
     sleep 1
     verify_table_data("unique_test", "unique_col = '#{uuid}'",
-      "1 | #{uuid} | \\xdeadbeef | 1 year 2 mons 3 days | {\"value\": \"updated_data\"}")
-
+      "1 | #{uuid} | #{Digest::MD5.hexdigest(binary_data)} | 1 year 2 mons 3 days | {\"value\": \"updated_data\"}")
 
     # Test DELETE
     @source_db.exec_params("DELETE FROM public.unique_test WHERE unique_col = $1", [uuid])
@@ -345,7 +347,7 @@ target-sync-schema: true
         SELECT (
           id::text || ' | ' ||
           unique_col::text || ' | ' ||
-          '\\x' || encode(binary_data, 'hex') || ' | ' ||
+          MD5(binary_data) || ' | ' ||
           interval_data::text || ' | ' ||
           data::text
         ) AS row_data

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"encoding/hex"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pgflo/pg_flo/pkg/utils"
@@ -109,18 +111,22 @@ func (s *PostgresSink) syncSchema(sourceHost string, sourcePort int, sourceDBNam
 
 // handleInsert processes an insert operation
 func (s *PostgresSink) handleInsert(tx pgx.Tx, message *utils.CDCMessage) error {
-	columns := make([]string, 0, len(message.Columns))
-	placeholders := make([]string, 0, len(message.Columns))
-	values := make([]interface{}, 0, len(message.Columns))
+	columns := make([]string, 0, len(message.Data))
+	placeholders := make([]string, 0, len(message.Data))
+	values := make([]interface{}, 0, len(message.Data))
+	i := 1
 
-	for i, col := range message.Columns {
-		value, err := message.GetColumnValue(col.Name, false)
+	for colName, value := range message.Data {
+		pgType := message.GetColumnType(colName)
+		convertedValue, err := s.convertValue(value, pgType)
 		if err != nil {
-			return fmt.Errorf("failed to get column value: %w", err)
+			return fmt.Errorf("failed to convert value for column %s: %w", colName, err)
 		}
-		columns = append(columns, col.Name)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
-		values = append(values, value)
+
+		columns = append(columns, colName)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i))
+		values = append(values, convertedValue)
+		i++
 	}
 
 	query := fmt.Sprintf(
@@ -131,8 +137,7 @@ func (s *PostgresSink) handleInsert(tx pgx.Tx, message *utils.CDCMessage) error 
 		strings.Join(placeholders, ", "),
 	)
 
-	// Add ON CONFLICT clause for PK/UNIQUE keys
-	if message.ReplicationKey.Type != utils.ReplicationKeyFull && len(message.ReplicationKey.Columns) > 0 {
+	if message.ReplicationKey != nil && message.ReplicationKey.Type != utils.ReplicationKeyFull && len(message.ReplicationKey.Columns) > 0 {
 		query += fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING",
 			strings.Join(message.ReplicationKey.Columns, ", "))
 	}
@@ -149,7 +154,6 @@ func getWhereConditions(message *utils.CDCMessage, useOldValues bool, startingIn
 	var conditions []string
 	var values []interface{}
 	valueIndex := startingIndex
-
 	switch message.ReplicationKey.Type {
 	case utils.ReplicationKeyFull:
 		// For FULL, use all non-null values
@@ -230,26 +234,16 @@ func (s *PostgresSink) handleUpdate(tx pgx.Tx, message *utils.CDCMessage) error 
 		return fmt.Errorf("invalid replication key configuration")
 	}
 
-	setClauses := make([]string, 0, len(message.Columns))
-	setValues := make([]interface{}, 0, len(message.Columns))
+	setClauses := make([]string, 0, len(message.Data))
+	setValues := make([]interface{}, 0, len(message.Data))
 	valueIndex := 1
 
-	for _, column := range message.Columns {
-		// Skip toasted columns
-		if message.IsColumnToasted(column.Name) {
-			continue
-		}
-
-		// Get the new value for the column
-		value, err := message.GetColumnValue(column.Name, false)
-		if err != nil {
-			return fmt.Errorf("failed to get column value: %w", err)
-		}
-
+	// Iterate over Data map directly
+	for colName, value := range message.Data {
 		if value == nil {
-			setClauses = append(setClauses, fmt.Sprintf("%s = NULL", column.Name))
+			setClauses = append(setClauses, fmt.Sprintf("%s = NULL", colName))
 		} else {
-			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", column.Name, valueIndex))
+			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", colName, valueIndex))
 			setValues = append(setValues, value)
 			valueIndex++
 		}
@@ -412,7 +406,7 @@ func (s *PostgresSink) writeBatchInternal(ctx context.Context, messages []*utils
 				}
 			}
 
-			switch message.Type {
+			switch message.Operation {
 			case utils.OperationInsert:
 				operationErr = s.handleInsert(tx, message)
 			case utils.OperationUpdate:
@@ -424,7 +418,7 @@ func (s *PostgresSink) writeBatchInternal(ctx context.Context, messages []*utils
 				newTx, operationErr = s.handleDDL(tx, message)
 				tx = newTx
 			default:
-				operationErr = fmt.Errorf("unknown operation type: %s", message.Type)
+				operationErr = fmt.Errorf("unknown operation type: %s", message.Operation)
 			}
 
 			if operationErr != nil && isConnectionError(operationErr) {
@@ -441,7 +435,7 @@ func (s *PostgresSink) writeBatchInternal(ctx context.Context, messages []*utils
 			}
 			tx = nil
 			return fmt.Errorf("failed to handle %s for table %s.%s: %v-%v",
-				message.Type,
+				message.Operation,
 				message.Schema,
 				message.Table,
 				err,
@@ -485,4 +479,32 @@ func isConnectionError(err error) bool {
 // Close closes the database connection
 func (s *PostgresSink) Close() error {
 	return s.conn.Close(context.Background())
+}
+
+// convertValue converts a value from CDCMessage to PostgreSQL compatible format
+func (s *PostgresSink) convertValue(value interface{}, pgType string) (interface{}, error) {
+	if value == nil {
+		return nil, nil
+	}
+
+	// TODO: Rethink bytea handling (source or sink responsibility?)
+	switch pgType {
+	case "bytea":
+		switch v := value.(type) {
+		case string:
+			if strings.HasPrefix(v, "\\x") {
+				// Decode hex string to bytes
+				hexStr := v[2:] // Remove \x prefix
+				return hex.DecodeString(hexStr)
+			}
+			// If no \x prefix, assume it's already hex encoded
+			return hex.DecodeString(v)
+		case []byte:
+			return v, nil
+		default:
+			return nil, fmt.Errorf("unsupported bytea value type: %T", v)
+		}
+	default:
+		return value, nil
+	}
 }

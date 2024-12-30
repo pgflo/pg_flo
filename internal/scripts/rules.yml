@@ -29,3 +29,31 @@ tables:
         mask_char: "X"
         allow_empty_deletes: true
       operations: [INSERT, UPDATE, DELETE]
+    - type: filter
+      column: balance
+      parameters:
+        operator: gte
+        value: 75.00
+        allow_empty_deletes: true
+      operations: [INSERT, UPDATE, DELETE]
+    - type: filter
+      column: score
+      parameters:
+        operator: lt
+        value: 2500000000
+        allow_empty_deletes: true
+      operations: [INSERT, UPDATE, DELETE]
+    - type: filter
+      column: rating
+      parameters:
+        operator: gt
+        value: 4.0
+        allow_empty_deletes: true
+      operations: [INSERT, UPDATE, DELETE]
+    - type: filter
+      column: weight
+      parameters:
+        operator: lte
+        value: 80.0
+        allow_empty_deletes: true
+      operations: [INSERT, UPDATE, DELETE]

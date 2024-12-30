@@ -11,6 +11,10 @@ create_users() {
     email text,
     phone text,
     age int,
+    balance numeric(10,2),
+    score bigint,
+    rating real,
+    weight double precision,
     ssn text,
     created_at timestamp DEFAULT current_timestamp
   );"
@@ -58,12 +62,12 @@ start_pg_flo_worker() {
 
 simulate_changes() {
   log "Simulating changes..."
-  run_sql "INSERT INTO public.users (email, phone, age, ssn) VALUES
-    ('john@example.com', '1234567890', 25, '123-45-6789'),
-    ('jane@example.com', '9876543210', 17, '987-65-4321'),
-    ('bob@example.com', '5551234567', 30, '555-12-3456');"
+  run_sql "INSERT INTO public.users (email, phone, age, balance, score, rating, weight, ssn) VALUES
+    ('john@example.com', '1234567890', 25, 100.50, 1000000000, 4.5, 75.5, '123-45-6789'),
+    ('jane@example.com', '9876543210', 17, 50.25, 2000000000, 3.8, 65.3, '987-65-4321'),
+    ('bob@example.com', '5551234567', 30, 75.75, 3000000000, 4.2, 80.1, '555-12-3456');"
 
-  run_sql "UPDATE public.users SET email = 'updated@example.com', phone = '1112223333' WHERE id = 1;"
+  run_sql "UPDATE public.users SET email = 'updated@example.com', phone = '1112223333', balance = 150.75 WHERE id = 1;"
   run_sql "DELETE FROM public.users WHERE age = 30;"
   run_sql "DELETE FROM public.users WHERE age = 17;"
 
@@ -72,28 +76,51 @@ simulate_changes() {
 
 verify_changes() {
   log "Verifying changes..."
-  local insert_count=$(jq -s '[.[] | select(.Type == "INSERT")] | length' "$OUTPUT_DIR"/*.jsonl)
-  local update_count=$(jq -s '[.[] | select(.Type == "UPDATE")] | length' "$OUTPUT_DIR"/*.jsonl)
-  local delete_count=$(jq -s '[.[] | select(.Type == "DELETE")] | length' "$OUTPUT_DIR"/*.jsonl)
+  local insert_count=$(jq -s '[.[] | select(.operation == "INSERT")] | length' "$OUTPUT_DIR"/*.jsonl)
+  local update_count=$(jq -s '[.[] | select(.operation == "UPDATE")] | length' "$OUTPUT_DIR"/*.jsonl)
+  local delete_count=$(jq -s '[.[] | select(.operation == "DELETE")] | length' "$OUTPUT_DIR"/*.jsonl)
 
-  log "INSERT count: $insert_count (expected 2)"
+  # We expect:
+  # - 1 INSERT (id=1, age=25 passes all filters)
+  # - 1 UPDATE (for id=1)
+  # - 2 DELETEs (for age=30 and age=17)
+  log "INSERT count: $insert_count (expected 1)"
   log "UPDATE count: $update_count (expected 1)"
   log "DELETE count: $delete_count (expected 2)"
 
-  if [ "$insert_count" -eq 2 ] && [ "$update_count" -eq 1 ] && [ "$delete_count" -eq 2 ]; then
+  if [ "$insert_count" -eq 1 ] && [ "$update_count" -eq 1 ] && [ "$delete_count" -eq 2 ]; then
     success "Change counts match expected values"
   else
     error "Change counts do not match expected values"
     return 1
   fi
 
+  # Verify numeric filters
+  local filtered_records=$(jq -r '.operation as $op | 
+    select($op == "INSERT") | 
+    select(
+      (.data.balance < 75.00) or
+      (.data.score >= 2500000000) or
+      (.data.rating <= 4.0) or
+      (.data.weight > 80.0)
+    ) | .data.id' "$OUTPUT_DIR"/*.jsonl)
+
+  if [[ -z "$filtered_records" ]]; then
+    success "Numeric filters working for all types"
+  else
+    error "Numeric filters not working correctly"
+    log "Records that should have been filtered: $filtered_records"
+    jq -r 'select(.data.id == '"$filtered_records"') | {id: .data.id, balance: .data.balance, score: .data.score, rating: .data.rating, weight: .data.weight}' "$OUTPUT_DIR"/*.jsonl
+    return 1
+  fi
+
   # Verify transformations and filters
-  local masked_email=$(jq -r 'select(.Type == "INSERT" and .NewTuple.id == 1) | .NewTuple.email' "$OUTPUT_DIR"/*.jsonl)
-  local formatted_phone=$(jq -r 'select(.Type == "INSERT" and .NewTuple.id == 1) | .NewTuple.phone' "$OUTPUT_DIR"/*.jsonl)
-  local filtered_insert=$(jq -r 'select(.Type == "INSERT" and .NewTuple.id == 2) | .NewTuple.id' "$OUTPUT_DIR"/*.jsonl)
-  local updated_email=$(jq -r 'select(.Type == "UPDATE") | .NewTuple.email' "$OUTPUT_DIR"/*.jsonl)
-  local masked_ssn=$(jq -r 'select(.Type == "INSERT" and .NewTuple.id == 1) | .NewTuple.ssn' "$OUTPUT_DIR"/*.jsonl)
-  local filtered_age=$(jq -r 'select(.Type == "INSERT" and .NewTuple.id == 2) | .NewTuple.age' "$OUTPUT_DIR"/*.jsonl)
+  local masked_email=$(jq -r 'select(.operation == "INSERT" and .data.id == 1) | .data.email' "$OUTPUT_DIR"/*.jsonl)
+  local formatted_phone=$(jq -r 'select(.operation == "INSERT" and .data.id == 1) | .data.phone' "$OUTPUT_DIR"/*.jsonl)
+  local filtered_insert=$(jq -r 'select(.operation == "INSERT" and .data.id == 2) | .data.id' "$OUTPUT_DIR"/*.jsonl)
+  local updated_email=$(jq -r 'select(.operation == "UPDATE") | .data.email' "$OUTPUT_DIR"/*.jsonl)
+  local masked_ssn=$(jq -r 'select(.operation == "INSERT" and .data.id == 1) | .data.ssn' "$OUTPUT_DIR"/*.jsonl)
+  local filtered_age=$(jq -r 'select(.operation == "INSERT" and .data.id == 2) | .data.age' "$OUTPUT_DIR"/*.jsonl)
 
   if [[ "$masked_email" == "j**************m" ]] &&
     [[ "$formatted_phone" == "(123) 456-7890" ]] &&
