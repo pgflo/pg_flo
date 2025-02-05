@@ -249,7 +249,7 @@ func (r *CopyAndStreamReplicator) getSchemaName(tx pgx.Tx, tableName string) (st
 // buildCopyQuery constructs the SQL query for copying a range of pages from a table.
 func (r *CopyAndStreamReplicator) buildCopyQuery(tableName string, schema string, startPage, endPage uint32) string {
 	// maybe we need to add schema here! - to comply with fully qualified names.
-	fullyQualifiedTableName := fmt.Sprintf("%s.%s", schema, tableName)
+	fullyQualifiedTableName := fmt.Sprintf("\"%s\".\"%s\"", schema, tableName)
 	query := fmt.Sprintf(`
 			SELECT *
 			FROM %s
