@@ -223,7 +223,7 @@ func (r *CopyAndStreamReplicator) CopyTableRange(ctx context.Context, tableName 
 		return 0, err
 	}
 
-	query := r.buildCopyQuery(tableName, startPage, endPage)
+	query := r.buildCopyQuery(tableName, schema, startPage, endPage)
 	return r.executeCopyQuery(ctx, tx, query, schema, tableName, workerID)
 }
 
@@ -247,12 +247,12 @@ func (r *CopyAndStreamReplicator) getSchemaName(tx pgx.Tx, tableName string) (st
 }
 
 // buildCopyQuery constructs the SQL query for copying a range of pages from a table.
-func (r *CopyAndStreamReplicator) buildCopyQuery(tableName string, startPage, endPage uint32) string {
+func (r *CopyAndStreamReplicator) buildCopyQuery(tableName string, schema string, startPage, endPage uint32) string {
 	query := fmt.Sprintf(`
 			SELECT *
 			FROM %s
 			WHERE ctid >= '(%d,0)'::tid AND ctid < '(%d,0)'::tid`,
-		pgx.Identifier{tableName}.Sanitize(), startPage, endPage)
+		pgx.Identifier{schema, tableName}.Sanitize(), startPage, endPage)
 	return query
 }
 
