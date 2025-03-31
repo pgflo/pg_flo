@@ -1,12 +1,11 @@
 module github.com/pgflo/pg_flo
 
 go 1.21.5
-
 require (
 	github.com/goccy/go-json v0.10.5
 	github.com/jackc/pglogrepl v0.0.0-20240307033717-828fbfe908e9
 	github.com/jackc/pgtype v1.14.4
-	github.com/jackc/pgx/v5 v5.7.2
+	github.com/jackc/pgx/v5 v5.7.4
 	github.com/nats-io/nats.go v1.38.0
 	github.com/rs/zerolog v1.33.0
 	github.com/shopspring/decimal v1.4.0
