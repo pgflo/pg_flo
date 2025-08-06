@@ -58,7 +58,8 @@ create_test_table() {
     tsquery_data tsquery NOT NULL,
     xml_data xml NOT NULL,
     enum_data mood NOT NULL,
-    composite_data name_type NOT NULL
+    composite_data name_type NOT NULL,
+    text_data_empty text NOT NULL default ''
   );"
   success "Test table created in source database"
 }
