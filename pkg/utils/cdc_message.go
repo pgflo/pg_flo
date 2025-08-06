@@ -73,15 +73,18 @@ func (m *CDCMessage) GetColumnValue(columnName string, useOldValues bool) (inter
 	}
 
 	var data []byte
+	var tupleType uint8
 	if useOldValues && m.OldTuple != nil {
 		data = m.OldTuple.Columns[colIndex].Data
+		tupleType = m.OldTuple.Columns[colIndex].DataType
 	} else if m.NewTuple != nil {
 		data = m.NewTuple.Columns[colIndex].Data
+		tupleType = m.NewTuple.Columns[colIndex].DataType
 	} else {
 		return nil, fmt.Errorf("no data available for column %s", columnName)
 	}
 
-	return DecodeValue(data, m.Columns[colIndex].DataType)
+	return DecodeValue(data, m.Columns[colIndex].DataType, tupleType)
 }
 
 // SetColumnValue sets the value of a column, respecting its type
@@ -223,8 +226,12 @@ func DecodeCDCMessage(data []byte) (*CDCMessage, error) {
 }
 
 // DecodeValue decodes a byte slice into a Go value based on the PostgreSQL data type
-func DecodeValue(data []byte, dataType uint32) (interface{}, error) {
+func DecodeValue(data []byte, dataType uint32, tupleType uint8) (interface{}, error) {
 	if data == nil {
+		if (dataType == pgtype.TextOID || dataType == pgtype.VarcharOID) && tupleType == pglogrepl.TupleDataTypeText {
+			// return empty, this results in replicating empty strings instead of forcing everything to null
+			return []byte{}, nil
+		}
 		return nil, nil
 	}
 	strData := string(data)
