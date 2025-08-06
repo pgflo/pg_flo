@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v5"
 	"github.com/pgflo/pg_flo/pkg/utils"
 )
@@ -290,9 +291,18 @@ func (r *CopyAndStreamReplicator) executeCopyQuery(ctx context.Context, tx pgx.T
 			if err != nil {
 				return 0, fmt.Errorf("error converting value: %v", err)
 			}
+			tupleType := pglogrepl.TupleDataTypeBinary
+			if value == nil {
+				tupleType = pglogrepl.TupleDataTypeNull
+			} else {
+				switch fieldDescriptions[i].DataTypeOID {
+				case pgtype.TextOID, pgtype.VarcharOID, pgtype.QCharOID, pgtype.ByteaOID:
+					tupleType = pglogrepl.TupleDataTypeText
+				}
+			}
 
 			tupleData.Columns[i] = &pglogrepl.TupleDataColumn{
-				DataType: uint8(fieldDescriptions[i].DataTypeOID),
+				DataType: tupleType,
 				Data:     data,
 			}
 		}
