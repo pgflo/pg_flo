@@ -109,6 +109,28 @@ func (m *CDCMessage) SetColumnValue(columnName string, value interface{}) error 
 	return nil
 }
 
+// RemoveColumn removes a column from the message
+func (m *CDCMessage) RemoveColumn(columnName string) error {
+	colIndex := m.GetColumnIndex(columnName)
+	if colIndex == -1 {
+		return fmt.Errorf("column %s not found", columnName)
+	}
+
+	newColumns := make([]*pglogrepl.RelationMessageColumn, len(m.Columns))
+	copy(newColumns, m.Columns)
+	m.Columns = append(newColumns[:colIndex], newColumns[colIndex+1:]...)
+
+	if m.NewTuple != nil {
+		m.NewTuple.ColumnNum--
+		m.NewTuple.Columns = append(m.NewTuple.Columns[:colIndex], m.NewTuple.Columns[colIndex+1:]...)
+	}
+	if m.OldTuple != nil {
+		m.OldTuple.ColumnNum--
+		m.OldTuple.Columns = append(m.OldTuple.Columns[:colIndex], m.OldTuple.Columns[colIndex+1:]...)
+	}
+	return nil
+}
+
 // EncodeCDCMessage encodes a CDCMessage into a byte slice
 func EncodeCDCMessage(m CDCMessage) ([]byte, error) {
 	var buf bytes.Buffer

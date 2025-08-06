@@ -43,6 +43,11 @@ type FilterRule struct {
 	AllowEmptyDeletes bool
 }
 
+type ExcludeColumnRule struct {
+	TableName  string
+	ColumnName string
+}
+
 // RuleEngine manages and applies rules to data
 type RuleEngine struct {
 	Rules map[string][]Rule // map of table name to slice of rules

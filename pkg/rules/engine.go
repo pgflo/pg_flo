@@ -74,6 +74,8 @@ func createRule(tableName string, config RuleConfig) (Rule, error) {
 		return NewTransformRule(tableName, config.Column, config.Parameters)
 	case "filter":
 		return NewFilterRule(tableName, config.Column, config.Parameters)
+	case "exclude_column":
+		return NewExcludeColumnRule(tableName, config.Column)
 	default:
 		return nil, fmt.Errorf("unknown rule type: %s", config.Type)
 	}

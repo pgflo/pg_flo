@@ -2,12 +2,11 @@ package rules
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"regexp"
 	"strings"
 	"time"
-
-	"os"
 
 	"github.com/jackc/pgtype"
 	"github.com/pgflo/pg_flo/pkg/utils"
@@ -174,6 +173,14 @@ func NewFilterRule(table, column string, params map[string]interface{}) (Rule, e
 		rule.Operations = []utils.OperationType{utils.OperationInsert, utils.OperationUpdate, utils.OperationDelete}
 	}
 
+	return rule, nil
+}
+
+func NewExcludeColumnRule(table, column string) (Rule, error) {
+	rule := &ExcludeColumnRule{
+		TableName:  table,
+		ColumnName: column,
+	}
 	return rule, nil
 }
 
@@ -396,6 +403,15 @@ func (r *FilterRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error)
 	}
 
 	return message, nil
+}
+
+// Apply applies the exclude_column rule to the provided data
+func (r *ExcludeColumnRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error) {
+	err := message.RemoveColumn(r.ColumnName)
+	if len(message.Columns) == 0 {
+		return nil, fmt.Errorf("exclude_column removed the last column from table: %s", r.TableName)
+	}
+	return message, err
 }
 
 // containsOperation checks if the given operation is in the list of operations
