@@ -299,6 +299,8 @@ func DecodeValue(data []byte, dataType uint32, tupleType uint8) (interface{}, er
 		var result interface{}
 		err := json.Unmarshal(data, &result)
 		return result, err
+	case pgtype.BPCharArrayOID, pgtype.QCharArrayOID:
+		return DecodeCharArray(data)
 	case pgtype.TextArrayOID, pgtype.VarcharArrayOID:
 		return DecodeTextArray(data)
 	case pgtype.Int2ArrayOID, pgtype.Int4ArrayOID, pgtype.Int8ArrayOID, pgtype.Float4ArrayOID, pgtype.Float8ArrayOID, pgtype.BoolArrayOID:
@@ -311,6 +313,18 @@ func DecodeValue(data []byte, dataType uint32, tupleType uint8) (interface{}, er
 // DecodeTextArray decodes a PostgreSQL text array into a []string
 func DecodeTextArray(data []byte) ([]string, error) {
 	if len(data) < 2 || data[0] != '{' || data[len(data)-1] != '}' {
+		return nil, fmt.Errorf("invalid array format")
+	}
+	elements := strings.Split(string(data[1:len(data)-1]), ",")
+	for i, elem := range elements {
+		elements[i] = strings.Trim(elem, "\"")
+	}
+	return elements, nil
+}
+
+// DecodeCharArray decodes a PostgreSQL text array into a []string
+func DecodeCharArray(data []byte) ([]string, error) {
+	if len(data) < 2 || data[0] != '[' || data[len(data)-1] != ']' {
 		return nil, fmt.Errorf("invalid array format")
 	}
 	elements := strings.Split(string(data[1:len(data)-1]), ",")
