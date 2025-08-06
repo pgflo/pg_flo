@@ -352,6 +352,81 @@ func TestNumericFilters(t *testing.T) {
 	}
 }
 
+func TestExcludeColumnRule(t *testing.T) {
+	createWithA := func(opType utils.OperationType, columnName string, dataType uint32, value interface{}) *utils.CDCMessage {
+		return &utils.CDCMessage{
+			Type: opType,
+			Columns: []*pglogrepl.RelationMessageColumn{
+				{Name: "a", DataType: dataType},
+				{Name: columnName, DataType: dataType},
+			},
+			NewTuple: &pglogrepl.TupleData{
+				ColumnNum: 2,
+				Columns: []*pglogrepl.TupleDataColumn{
+					{Data: encodeValue(1)}, // a
+					{Data: encodeValue(value)},
+				},
+			},
+		}
+	}
+	createWithC := func(opType utils.OperationType, columnName string, dataType uint32, value interface{}) *utils.CDCMessage {
+		return &utils.CDCMessage{
+			Type: opType,
+			Columns: []*pglogrepl.RelationMessageColumn{
+				{Name: "a", DataType: dataType},
+				{Name: columnName, DataType: dataType},
+				{Name: "c", DataType: dataType},
+			},
+			NewTuple: &pglogrepl.TupleData{
+				ColumnNum: 3,
+				Columns: []*pglogrepl.TupleDataColumn{
+					{Data: encodeValue(1)}, // a
+					{Data: encodeValue(value)},
+					{Data: encodeValue(3)}, // c
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name           string
+		rule           rules.Rule
+		input          *utils.CDCMessage
+		expectedOutput *utils.CDCMessage
+		wantErr        bool
+	}{
+		{
+			name:           "Simple exclude column - Pass",
+			rule:           createRule(t, "exclude_column", "products", "a", nil),
+			input:          createWithA(utils.OperationInsert, "price", pgtype.Int4OID, 2),
+			expectedOutput: createCDCMessage(utils.OperationInsert, "price", pgtype.Int4OID, 2),
+		},
+		{
+			name:           "Exclude column c - Pass",
+			rule:           createRule(t, "exclude_column", "products", "c", nil),
+			input:          createWithC(utils.OperationInsert, "price", pgtype.Int4OID, 2),
+			expectedOutput: createWithA(utils.OperationInsert, "price", pgtype.Int4OID, 2),
+		},
+		{
+			name:           "Exclude all columns - Error",
+			rule:           createRule(t, "exclude_column", "products", "price", nil),
+			input:          createCDCMessage(utils.OperationInsert, "price", pgtype.Int4OID, 2),
+			expectedOutput: nil,
+			wantErr:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, err := tt.rule.Apply(tt.input)
+			if !tt.wantErr {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.expectedOutput, output)
+		})
+	}
+}
+
 func createRule(t *testing.T, ruleType, table, column string, params map[string]interface{}) rules.Rule {
 	var rule rules.Rule
 	var err error
@@ -361,6 +436,8 @@ func createRule(t *testing.T, ruleType, table, column string, params map[string]
 		rule, err = rules.NewTransformRule(table, column, params)
 	case "filter":
 		rule, err = rules.NewFilterRule(table, column, params)
+	case "exclude_column":
+		rule, err = rules.NewExcludeColumnRule(table, column)
 	default:
 		t.Fatalf("Unknown rule type: %s", ruleType)
 	}
@@ -379,6 +456,7 @@ func createCDCMessage(opType utils.OperationType, columnName string, dataType ui
 			{Name: columnName, DataType: dataType},
 		},
 		NewTuple: &pglogrepl.TupleData{
+			ColumnNum: 1,
 			Columns: []*pglogrepl.TupleDataColumn{
 				{Data: encodeValue(value)},
 			},

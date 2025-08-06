@@ -187,11 +187,17 @@ Rules are defined in a separate YAML file:
 
 ```yaml
 # rules.yaml
-users:
-  - type: exclude_columns
-    columns: [password, ssn]
-  - type: mask_columns
-    columns: [email]
+tables:
+    users:
+      - type: exclude_column
+        columns: password
+      - type: exclude_column
+        columns: ssn
+      - type: transform
+        column: email
+        parameters:
+          type: mask
+          mask_char: "*"
 ```
 
 ```shell
