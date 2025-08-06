@@ -113,7 +113,10 @@ func (m *CDCMessage) RemoveColumn(columnName string) error {
 		return fmt.Errorf("column %s not found", columnName)
 	}
 
-	m.Columns = append(m.Columns[:colIndex], m.Columns[colIndex+1:]...)
+	newColumns := make([]*pglogrepl.RelationMessageColumn, len(m.Columns))
+	copy(newColumns, m.Columns)
+	m.Columns = append(newColumns[:colIndex], newColumns[colIndex+1:]...)
+
 	if m.NewTuple != nil {
 		m.NewTuple.ColumnNum--
 		m.NewTuple.Columns = append(m.NewTuple.Columns[:colIndex], m.NewTuple.Columns[colIndex+1:]...)
