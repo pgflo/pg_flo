@@ -85,9 +85,70 @@ func TestBaseReplicator(t *testing.T) {
 						return nil
 					},
 				})
+			mockTables := new(MockRows)
+			mockTables.On("Next").Return(true).Twice()
+			mockTables.On("Next").Return(false).Once()
+			mockTables.On("Scan", mock.AnythingOfType("*string")).Once().Run(func(args mock.Arguments) {
+				*args.Get(0).(*string) = "public.users"
+			}).Return(nil)
+			mockTables.On("Scan", mock.AnythingOfType("*string")).Once().Run(func(args mock.Arguments) {
+				*args.Get(0).(*string) = "public.orders"
+			}).Return(nil)
+			mockTables.On("Close").Return().Once()
+			mockTables.On("Err").Return(nil).Maybe()
+
+			mockStandardConn.On("Query", mock.Anything, "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1", mock.Anything).
+				Return(mockTables, nil)
 
 			br := &replicator.BaseReplicator{
-				Config:       replicator.Config{Group: "existing_pub"},
+				Config: replicator.Config{
+					Group:  "existing_pub",
+					Schema: "public",
+					Tables: []string{"users", "orders"},
+				},
+				StandardConn: mockStandardConn,
+				Logger:       utils.NewZerologLogger(zerolog.New(nil)),
+			}
+
+			err := br.CreatePublication()
+			assert.NoError(t, err)
+			mockStandardConn.AssertExpectations(t)
+		})
+
+		t.Run("Publication already exists with different tables", func(t *testing.T) {
+			mockStandardConn := new(MockStandardConnection)
+			mockStandardConn.On("QueryRow", mock.Anything, "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", mock.Anything).
+				Return(MockRow{
+					scanFunc: func(dest ...interface{}) error {
+						*dest[0].(*bool) = true
+						return nil
+					},
+				})
+			mockTables := new(MockRows)
+			mockTables.On("Next").Return(true).Once()
+			mockTables.On("Next").Return(false).Once()
+			mockTables.On("Scan", mock.AnythingOfType("*string")).Run(func(args mock.Arguments) {
+				*args.Get(0).(*string) = "public.something"
+			}).Return(nil)
+			mockTables.On("Close").Return().Once()
+			mockTables.On("Err").Return(nil).Maybe()
+
+			mockStandardConn.On("Query", mock.Anything, "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1", mock.Anything).
+				Return(mockTables, nil)
+
+			mockStandardConn.On("Exec", mock.Anything, `DROP PUBLICATION "pg_flo_existing_pub_config_publication"`, mock.Anything).
+				Return(pgconn.CommandTag{}, nil)
+
+			expectedQuery := `CREATE PUBLICATION "pg_flo_existing_pub_config_publication" FOR TABLE "public"."users", "public"."orders"`
+			mockStandardConn.On("Exec", mock.Anything, expectedQuery, mock.Anything).
+				Return(pgconn.CommandTag{}, nil)
+
+			br := &replicator.BaseReplicator{
+				Config: replicator.Config{
+					Group:  "existing_pub_config",
+					Schema: "public",
+					Tables: []string{"users", "orders"},
+				},
 				StandardConn: mockStandardConn,
 				Logger:       utils.NewZerologLogger(zerolog.New(nil)),
 			}
