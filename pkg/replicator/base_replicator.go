@@ -2,12 +2,11 @@ package replicator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
-
-	"errors"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -113,17 +112,39 @@ func (r *BaseReplicator) buildCreatePublicationQuery() (string, error) {
 		strings.Join(sanitizedTables, ", ")), nil
 }
 
+// buildDeletePublicationQuery constructs the SQL query for creating a publication
+func (r *BaseReplicator) buildDeletePublicationQuery() (string, error) {
+	publicationName := GeneratePublicationName(r.Config.Group)
+	return fmt.Sprintf("DROP PUBLICATION %s", pgx.Identifier{publicationName}.Sanitize()), nil
+}
+
 // CreatePublication creates a new publication if it doesn't exist
 func (r *BaseReplicator) CreatePublication() error {
 	publicationName := GeneratePublicationName(r.Config.Group)
-	exists, err := r.checkPublicationExists(publicationName)
+	exists, existingTables, err := r.checkPublicationExists(publicationName)
 	if err != nil {
 		return fmt.Errorf("failed to check if publication exists: %w", err)
 	}
 
 	if exists {
-		r.Logger.Info().Str("publication", publicationName).Msg("Publication already exists")
-		return nil
+		expectedTables, err := r.GetConfiguredTables(context.Background())
+		if err != nil {
+			return fmt.Errorf("failed to get expected tables: %w", err)
+		}
+		if utils.SlicesEqual(expectedTables, existingTables) {
+			r.Logger.Info().Str("publication", publicationName).Msg("Publication already exists")
+			return nil
+		}
+
+		r.Logger.Info().Str("publication", publicationName).Msg("Recreating publication")
+		deleteQuery, err := r.buildDeletePublicationQuery()
+		if err != nil {
+			return fmt.Errorf("failed to build delete query: %w", err)
+		}
+		_, err = r.StandardConn.Exec(context.Background(), deleteQuery)
+		if err != nil {
+			return fmt.Errorf("failed to delete publication: %w", err)
+		}
 	}
 
 	query, err := r.buildCreatePublicationQuery()
@@ -141,13 +162,30 @@ func (r *BaseReplicator) CreatePublication() error {
 }
 
 // checkPublicationExists checks if a publication with the given name exists
-func (r *BaseReplicator) checkPublicationExists(publicationName string) (bool, error) {
+func (r *BaseReplicator) checkPublicationExists(publicationName string) (bool, []string, error) {
+	var tables []string
 	var exists bool
 	err := r.StandardConn.QueryRow(context.Background(), "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", publicationName).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("error checking publication: %w", err)
+		return false, tables, fmt.Errorf("error checking publication: %w", err)
 	}
-	return exists, nil
+	if !exists {
+		return false, tables, nil
+	}
+	rows, err := r.StandardConn.Query(context.Background(), "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1", publicationName)
+	if err != nil {
+		return false, tables, fmt.Errorf("error checking publication tables: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return false, tables, fmt.Errorf("error checking publication tables: %w", err)
+		}
+		tables = append(tables, table)
+	}
+
+	return exists, tables, nil
 }
 
 // StartReplicationFromLSN initiates the replication process from a given LSN
