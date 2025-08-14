@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/goccy/go-json"
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -229,6 +230,12 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 		mockPKRows.AssertExpectations(t)
 	})
 	t.Run("CopyTableRange with diverse data types", func(t *testing.T) {
+		type expected struct {
+			name  string
+			value string
+			oid   string
+			tuple string
+		}
 		testCases := []struct {
 			name           string
 			relationFields []pgconn.FieldDescription
@@ -240,17 +247,19 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 				relationFields: []pgconn.FieldDescription{
 					{Name: "id", DataTypeOID: pgtype.Int4OID},
 					{Name: "name", DataTypeOID: pgtype.TextOID},
+					{Name: "coach", DataTypeOID: pgtype.TextOID},
 					{Name: "active", DataTypeOID: pgtype.BoolOID},
 					{Name: "score", DataTypeOID: pgtype.Float8OID},
 				},
 				tupleData: []interface{}{
-					int64(1), "John Doe", true, float64(9.99),
+					int64(1), "John Doe", "", true, float64(9.99),
 				},
 				expected: []map[string]interface{}{
-					{"name": "id", "type": "int4", "value": int64(1)},
-					{"name": "name", "type": "text", "value": "John Doe"},
-					{"name": "active", "type": "bool", "value": true},
-					{"name": "score", "type": "float8", "value": float64(9.99)},
+					{"name": "id", "type": "int4", "tupleType": pglogrepl.TupleDataTypeBinary, "value": int64(1)},
+					{"name": "name", "type": "text", "tupleType": pglogrepl.TupleDataTypeText, "value": "John Doe"},
+					{"name": "coach", "type": "text", "tupleType": pglogrepl.TupleDataTypeText, "value": ""},
+					{"name": "active", "type": "bool", "tupleType": pglogrepl.TupleDataTypeBinary, "value": true},
+					{"name": "score", "type": "float8", "tupleType": pglogrepl.TupleDataTypeBinary, "value": float64(9.99)},
 				},
 			},
 			{
@@ -268,10 +277,10 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 					time.Date(2023, time.May, 1, 12, 34, 56, 789000000, time.UTC),
 				},
 				expected: []map[string]interface{}{
-					{"name": "data", "type": "jsonb", "value": json.RawMessage(`{"key": "value"}`)},
-					{"name": "tags", "type": "text[]", "value": "{tag1,tag2,tag3}"},
-					{"name": "image", "type": "bytea", "value": []byte{0x01, 0x02, 0x03, 0x04}},
-					{"name": "created_at", "type": "timestamptz", "value": time.Date(2023, time.May, 1, 12, 34, 56, 789000000, time.UTC)},
+					{"name": "data", "type": "jsonb", "tupleType": pglogrepl.TupleDataTypeBinary, "value": json.RawMessage(`{"key": "value"}`)},
+					{"name": "tags", "type": "text[]", "tupleType": pglogrepl.TupleDataTypeBinary, "value": "{tag1,tag2,tag3}"},
+					{"name": "image", "type": "bytea", "tupleType": pglogrepl.TupleDataTypeText, "value": []byte{0x01, 0x02, 0x03, 0x04}},
+					{"name": "created_at", "type": "timestamptz", "tupleType": pglogrepl.TupleDataTypeBinary, "value": time.Date(2023, time.May, 1, 12, 34, 56, 789000000, time.UTC)},
 				},
 			},
 			{
@@ -285,9 +294,9 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 					int64(32767), int64(9223372036854775807), "123456.789",
 				},
 				expected: []map[string]interface{}{
-					{"name": "small_int", "type": "int2", "value": int64(32767)},
-					{"name": "big_int", "type": "int8", "value": int64(9223372036854775807)},
-					{"name": "numeric", "type": "numeric", "value": "123456.789"},
+					{"name": "small_int", "type": "int2", "tupleType": pglogrepl.TupleDataTypeBinary, "value": int64(32767)},
+					{"name": "big_int", "type": "int8", "tupleType": pglogrepl.TupleDataTypeBinary, "value": int64(9223372036854775807)},
+					{"name": "numeric", "type": "numeric", "tupleType": pglogrepl.TupleDataTypeBinary, "value": "123456.789"},
 				},
 			},
 		}
@@ -351,9 +360,11 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 					for i, expectedValue := range tc.expected {
 						actualColumn := decodedMsg.NewTuple.Columns[i]
 						expectedType := expectedValue["type"].(string)
+						expectedTupleType := expectedValue["tupleType"].(uint8)
 						expectedVal := expectedValue["value"]
 
 						assert.Equal(t, expectedType, utils.OIDToString(decodedMsg.Columns[i].DataType), "Type mismatch for field %s", decodedMsg.Columns[i].Name)
+						assert.Equal(t, expectedTupleType, decodedMsg.NewTuple.Columns[i].DataType, fmt.Sprintf("Tuple type mismatch for field %s", decodedMsg.Columns[i].Name))
 
 						switch expectedType {
 						case "int2", "int4", "int8":
