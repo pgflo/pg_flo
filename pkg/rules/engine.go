@@ -23,12 +23,6 @@ func (re *RuleEngine) ApplyRules(message *utils.CDCMessage) (*utils.CDCMessage, 
 		return message, nil // No rules for this table
 	}
 
-	logger.Info().
-		Str("table", message.Table).
-		Str("operation", string(message.Type)).
-		Int("ruleCount", len(rules)).
-		Msg("Applying rules")
-
 	var err error
 	for _, rule := range rules {
 		message, err = rule.Apply(message)

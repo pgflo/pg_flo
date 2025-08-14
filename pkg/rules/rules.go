@@ -408,10 +408,16 @@ func (r *FilterRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error)
 // Apply applies the exclude_column rule to the provided data
 func (r *ExcludeColumnRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error) {
 	err := message.RemoveColumn(r.ColumnName)
+	if err != nil {
+		if _, ok := err.(utils.ColumnNotFoundError); !ok {
+			// make this a warning since some columns are produced in copy but not in logs
+			logger.Warn().Str("column", r.ColumnName).Err(err).Msg("Failed to exclude column")
+		}
+	}
 	if len(message.Columns) == 0 {
 		return nil, fmt.Errorf("exclude_column removed the last column from table: %s", r.TableName)
 	}
-	return message, err
+	return message, nil
 }
 
 // containsOperation checks if the given operation is in the list of operations
