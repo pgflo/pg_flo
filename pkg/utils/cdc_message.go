@@ -27,6 +27,10 @@ func init() {
 	gob.Register(pglogrepl.TupleDataColumn{})
 }
 
+type ColumnNotFoundError struct {
+	ColumnName string
+}
+
 // CDCMessage represents a full message for Change Data Capture
 type CDCMessage struct {
 	Type           OperationType
@@ -109,11 +113,15 @@ func (m *CDCMessage) SetColumnValue(columnName string, value interface{}) error 
 	return nil
 }
 
+func (e ColumnNotFoundError) Error() string {
+	return fmt.Sprintf("column %s not found", e.ColumnName)
+}
+
 // RemoveColumn removes a column from the message
 func (m *CDCMessage) RemoveColumn(columnName string) error {
 	colIndex := m.GetColumnIndex(columnName)
 	if colIndex == -1 {
-		return fmt.Errorf("column %s not found", columnName)
+		return ColumnNotFoundError{columnName}
 	}
 
 	newColumns := make([]*pglogrepl.RelationMessageColumn, len(m.Columns))
