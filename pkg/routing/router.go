@@ -56,28 +56,42 @@ func (r *Router) ApplyRouting(message *utils.CDCMessage) (*utils.CDCMessage, err
 	routedMessage.Table = route.DestinationTable
 
 	if len(route.ColumnMappings) > 0 {
-		newColumns := make([]*pglogrepl.RelationMessageColumn, len(message.Columns))
-		for i, col := range message.Columns {
-			newCol := *col
-			mappedName := GetMappedColumnName(route.ColumnMappings, col.Name)
-			if mappedName != "" {
-				newCol.Name = mappedName
-			}
-			newColumns[i] = &newCol
+		// Build mapping lookup once for efficiency
+		columnMap := make(map[string]string, len(route.ColumnMappings))
+		for _, mapping := range route.ColumnMappings {
+			columnMap[mapping.Source] = mapping.Destination
 		}
-		routedMessage.Columns = newColumns
 
-		if routedMessage.ReplicationKey.Type != utils.ReplicationKeyFull {
-			mappedColumns := make([]string, len(routedMessage.ReplicationKey.Columns))
-			for i, keyCol := range routedMessage.ReplicationKey.Columns {
-				mappedName := GetMappedColumnName(route.ColumnMappings, keyCol)
-				if mappedName != "" {
-					mappedColumns[i] = mappedName
+		// Only copy and modify if mappings actually apply
+		hasChanges := false
+		for _, col := range message.Columns {
+			if _, exists := columnMap[col.Name]; exists {
+				hasChanges = true
+				break
+			}
+		}
+
+		if hasChanges {
+			newColumns := make([]*pglogrepl.RelationMessageColumn, len(message.Columns))
+			for i, col := range message.Columns {
+				if mappedName, exists := columnMap[col.Name]; exists {
+					newCol := *col
+					newCol.Name = mappedName
+					newColumns[i] = &newCol
 				} else {
-					mappedColumns[i] = keyCol
+					newColumns[i] = col
 				}
 			}
-			routedMessage.ReplicationKey.Columns = mappedColumns
+			routedMessage.Columns = newColumns
+
+			// Update replication key columns
+			if routedMessage.ReplicationKey.Type != utils.ReplicationKeyFull {
+				for i, keyCol := range routedMessage.ReplicationKey.Columns {
+					if mappedName, exists := columnMap[keyCol]; exists {
+						routedMessage.ReplicationKey.Columns[i] = mappedName
+					}
+				}
+			}
 		}
 	}
 

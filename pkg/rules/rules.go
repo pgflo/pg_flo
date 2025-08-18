@@ -3,15 +3,14 @@ package rules
 import (
 	"fmt"
 	"os"
-	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/rs/zerolog"
-	"github.com/shopspring/decimal"
 )
 
 var logger zerolog.Logger
@@ -30,35 +29,36 @@ func NewTransformRule(table, column string, params map[string]interface{}) (Rule
 		return nil, fmt.Errorf("transform type is required for TransformRule")
 	}
 
-	operations, _ := params["operations"].([]utils.OperationType)
-	allowEmptyDeletes, _ := params["allow_empty_deletes"].(bool)
+	var rule *TransformRule
+	var err error
 
 	switch transformType {
 	case "regex":
-		rule, err := NewRegexTransformRule(table, column, params)
-		if err != nil {
-			return nil, err
-		}
-		rule.Operations = operations
-		rule.AllowEmptyDeletes = allowEmptyDeletes
-		if len(rule.Operations) == 0 {
-			rule.Operations = []utils.OperationType{utils.OperationInsert, utils.OperationUpdate, utils.OperationDelete}
-		}
-		return rule, nil
+		rule, err = NewRegexTransformRule(table, column, params)
 	case "mask":
-		rule, err := NewMaskTransformRule(table, column, params)
-		if err != nil {
-			return nil, err
-		}
-		rule.Operations = operations
-		rule.AllowEmptyDeletes = allowEmptyDeletes
-		if len(rule.Operations) == 0 {
-			rule.Operations = []utils.OperationType{utils.OperationInsert, utils.OperationUpdate, utils.OperationDelete}
-		}
-		return rule, nil
+		rule, err = NewMaskTransformRule(table, column, params)
 	default:
 		return nil, fmt.Errorf("unsupported transform type: %s", transformType)
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return setupRuleOperations(rule, params), nil
+}
+
+// setupRuleOperations consolidates common operation and allowEmptyDeletes setup
+func setupRuleOperations(rule *TransformRule, params map[string]interface{}) *TransformRule {
+	operations, _ := params["operations"].([]utils.OperationType)
+	allowEmptyDeletes, _ := params["allow_empty_deletes"].(bool)
+
+	rule.Operations = operations
+	rule.AllowEmptyDeletes = allowEmptyDeletes
+	if len(rule.Operations) == 0 {
+		rule.Operations = []utils.OperationType{utils.OperationInsert, utils.OperationUpdate, utils.OperationDelete}
+	}
+	return rule
 }
 
 // NewRegexTransformRule creates a new regex transform rule
@@ -77,24 +77,28 @@ func NewRegexTransformRule(table, column string, params map[string]interface{}) 
 	}
 
 	transform := func(m *utils.CDCMessage) (*utils.CDCMessage, error) {
-		value, err := m.GetColumnValue(column, false)
-		if err != nil {
+		rawData, colIndex := getRawColumnData(m, column)
+		if rawData == nil || colIndex == -1 {
 			return m, nil
 		}
-		str, ok := value.(string)
-		if !ok {
+
+		// Only apply regex to text-like data
+		dataType := m.Columns[colIndex].DataType
+		if !isTextType(dataType) {
 			logger.Warn().
 				Str("table", table).
 				Str("column", column).
-				Str("type", fmt.Sprintf("%T", value)).
-				Msg("Regex transform skipped: only works on string values")
+				Uint32("dataType", dataType).
+				Msg("Regex transform skipped: only works on text types")
 			return m, nil
 		}
-		transformed := regex.ReplaceAllString(str, replace)
-		err = m.SetColumnValue(column, transformed)
-		if err != nil {
-			return nil, err
-		}
+
+		// Transform at text level - preserves PostgreSQL semantics
+		original := string(rawData)
+		transformed := regex.ReplaceAllString(original, replace)
+
+		// Set directly back - no encoding needed
+		setRawColumnData(m, colIndex, []byte(transformed))
 		return m, nil
 	}
 	return &TransformRule{TableName: table, ColumnName: column, Transform: transform}, nil
@@ -108,32 +112,64 @@ func NewMaskTransformRule(table, column string, params map[string]interface{}) (
 	}
 
 	transform := func(m *utils.CDCMessage) (*utils.CDCMessage, error) {
-		useOldValues := m.Type == utils.OperationDelete
-		value, err := m.GetColumnValue(column, useOldValues)
-		if err != nil {
+		rawData, colIndex := getRawColumnData(m, column)
+		if rawData == nil || colIndex == -1 {
 			return m, nil
 		}
-		str, ok := value.(string)
-		if !ok {
+
+		// Only apply mask to text-like data
+		dataType := m.Columns[colIndex].DataType
+		if !isTextType(dataType) {
 			logger.Warn().
 				Str("table", table).
 				Str("column", column).
-				Str("type", fmt.Sprintf("%T", value)).
-				Msg("Mask transform skipped: only works on string values")
+				Uint32("dataType", dataType).
+				Msg("Mask transform skipped: only works on text types")
 			return m, nil
 		}
-		if len(str) <= 2 {
+
+		// Transform at text level
+		original := string(rawData)
+		if len(original) <= 2 {
 			return m, nil
 		}
-		masked := string(str[0]) + strings.Repeat(maskChar, len(str)-2) + string(str[len(str)-1])
-		err = m.SetColumnValue(column, masked)
-		if err != nil {
-			return nil, err
-		}
+
+		masked := string(original[0]) + strings.Repeat(maskChar, len(original)-2) + string(original[len(original)-1])
+		setRawColumnData(m, colIndex, []byte(masked))
 		return m, nil
 	}
 
 	return &TransformRule{TableName: table, ColumnName: column, Transform: transform}, nil
+}
+
+func getRawColumnData(m *utils.CDCMessage, column string) ([]byte, int) {
+	colIndex := m.GetColumnIndex(column)
+	if colIndex == -1 {
+		return nil, -1
+	}
+
+	var rawData []byte
+	useOldValues := m.Type == utils.OperationDelete
+	if useOldValues && m.OldTuple != nil {
+		rawData = m.OldTuple.Columns[colIndex].Data
+	} else if m.NewTuple != nil {
+		rawData = m.NewTuple.Columns[colIndex].Data
+	} else if m.CopyData != nil {
+		rawData = m.CopyData[colIndex]
+	}
+
+	return rawData, colIndex
+}
+
+func setRawColumnData(m *utils.CDCMessage, colIndex int, data []byte) {
+	useOldValues := m.Type == utils.OperationDelete
+	if useOldValues && m.OldTuple != nil {
+		m.OldTuple.Columns[colIndex].Data = data
+	} else if m.NewTuple != nil {
+		m.NewTuple.Columns[colIndex].Data = data
+	} else if m.CopyData != nil {
+		m.CopyData[colIndex] = data
+	}
 }
 
 // NewFilterRule creates a new filter rule based on the provided parameters
@@ -184,360 +220,226 @@ func NewExcludeColumnRule(table, column string) (Rule, error) {
 	return rule, nil
 }
 
-// NewComparisonCondition creates a new comparison condition function
+// NewComparisonCondition creates a new comparison condition function using PostgreSQL semantics
 func NewComparisonCondition(column, operator string, value interface{}) func(*utils.CDCMessage) bool {
 	return func(m *utils.CDCMessage) bool {
-		useOldValues := m.Type == utils.OperationDelete
-		columnValue, err := m.GetColumnValue(column, useOldValues)
-		if err != nil {
+		rawData, colIndex := getRawColumnData(m, column)
+		if rawData == nil || colIndex == -1 {
 			return false
 		}
 
-		colIndex := m.GetColumnIndex(column)
-		if colIndex == -1 {
-			return false
-		}
+		columnValue := string(rawData)
+		ruleValue := fmt.Sprintf("%v", value)
+		dataType := m.Columns[colIndex].DataType
 
-		// Unified comparison - work directly with pgx native types
-		return compareAnyValues(columnValue, value, operator)
+		return comparePostgreSQLValues(columnValue, ruleValue, operator, dataType)
 	}
 }
 
 // NewContainsCondition creates a new contains condition function
 func NewContainsCondition(column string, value interface{}) func(*utils.CDCMessage) bool {
 	return func(m *utils.CDCMessage) bool {
-		useOldValues := m.Type == utils.OperationDelete
-		columnValue, err := m.GetColumnValue(column, useOldValues)
-		if err != nil {
+		rawData, colIndex := getRawColumnData(m, column)
+		if rawData == nil || colIndex == -1 {
 			return false
 		}
-		str, ok := columnValue.(string)
-		if !ok {
-			return false
-		}
-		searchStr, ok := value.(string)
-		if !ok {
-			return false
-		}
-		return strings.Contains(str, searchStr)
+
+		columnValue := string(rawData)
+		searchStr := fmt.Sprintf("%v", value)
+		return strings.Contains(columnValue, searchStr)
 	}
 }
 
-// compareAnyValues is a unified comparison function that works with any type
-func compareAnyValues(a, b interface{}, operator string) bool {
-	// Handle nil values
-	if a == nil || b == nil {
-		switch operator {
-		case "eq":
-			return a == nil && b == nil
-		case "ne":
-			return !(a == nil && b == nil)
-		default:
-			return false
-		}
-	}
-
-	// Handle time.Time with timezone awareness
-	if aTime, ok := a.(time.Time); ok {
-		if bTime, ok := b.(time.Time); ok {
-			return compareTime(aTime, bTime, operator)
-		}
-		// Try to parse string as time
-		if bStr := fmt.Sprintf("%v", b); bStr != "" {
-			if bTime, err := utils.ParseTimestamp(bStr); err == nil {
-				return compareTime(aTime, bTime, operator)
-			}
-		}
-		return false
-	}
-
-	// Handle pgtype.Numeric with precision
-	if aNum, ok := a.(pgtype.Numeric); ok {
-		if !aNum.Valid {
-			return false
-		}
-		aDec := decimal.NewFromBigInt(aNum.Int, aNum.Exp)
-		bDec, err := decimal.NewFromString(fmt.Sprintf("%v", b))
-		if err != nil {
-			return false
-		}
-		return compareDecimalValues(aDec, bDec, operator)
-	}
-
-	// Handle numeric mixing (int vs float) - ONLY if both are actually numeric
-	if isNumeric(a) && isNumeric(b) {
-		aFloat, aOk := convertToFloat64(a)
-		bFloat, bOk := convertToFloat64(b)
-		if aOk && bOk {
-			return compareFloat64(aFloat, bFloat, operator)
-		}
-	}
-
-	// Try to convert rule value (b) to match column type (a) for user-friendly rules
-	if convertedB, ok := tryConvertRuleValue(b, a); ok {
-		// Use the converted value for comparison
-		switch operator {
-		case "eq":
-			return reflect.DeepEqual(a, convertedB)
-		case "ne":
-			return !reflect.DeepEqual(a, convertedB)
-		default:
-			// For ordering, ensure both are the same type now
-			return compareConvertedValues(a, convertedB, operator)
-		}
-	}
-
-	// If conversion failed, check strict type compatibility
-	aType := reflect.TypeOf(a)
-	bType := reflect.TypeOf(b)
-	if !areTypesCompatible(aType, bType) {
+// comparePostgreSQLValues uses PostgreSQL's text comparison semantics - much simpler and more reliable
+func comparePostgreSQLValues(a, b, operator string, dataType uint32) bool {
+	// Check for strict type compatibility based on the rule value type
+	if !isRuleValueCompatibleWithColumn(b, dataType) {
 		return false // Incompatible types fail comparison
 	}
 
-	// Direct comparison for compatible types
+	// For booleans, handle PostgreSQL's 't'/'f' representation
+	if isBoolType(dataType) {
+		return compareBooleanStrings(a, b, operator)
+	}
+
 	switch operator {
 	case "eq":
-		return reflect.DeepEqual(a, b)
+		// For numeric types, normalize values for comparison
+		if isNumericType(dataType) {
+			return compareNumericStrings(a, b, "eq")
+		}
+		// For timestamps, handle timezone equivalence
+		if isTimeType(dataType) {
+			return compareTimeStrings(a, b, "eq")
+		}
+		// Default string comparison
+		return a == b
 	case "ne":
-		return !reflect.DeepEqual(a, b)
-	default:
-		// For ordering on compatible types, use string comparison as fallback
-		aStr := fmt.Sprintf("%v", a)
-		bStr := fmt.Sprintf("%v", b)
-		return compareStringValues(aStr, bStr, operator)
+		// Inverse of eq logic
+		if isNumericType(dataType) {
+			return !compareNumericStrings(a, b, "eq")
+		}
+		if isTimeType(dataType) {
+			return !compareTimeStrings(a, b, "eq")
+		}
+		return a != b
+	case "gt", "lt", "gte", "lte":
+		// For numeric types, do numeric comparison
+		if isNumericType(dataType) {
+			return compareNumericStrings(a, b, operator)
+		}
+		// For timestamps, do time comparison
+		if isTimeType(dataType) {
+			return compareTimeStrings(a, b, operator)
+		}
+		// For booleans, ordering doesn't make sense
+		if isBoolType(dataType) {
+			return false
+		}
+		// Default: lexicographic (works for most types like text, char, etc.)
+		return compareLexicographic(a, b, operator)
 	}
-}
-
-// Helper functions for unified comparison system
-
-// tryConvertRuleValue attempts to convert rule value to match column type
-func tryConvertRuleValue(ruleValue, columnValue interface{}) (interface{}, bool) {
-	ruleStr := fmt.Sprintf("%v", ruleValue)
-
-	switch columnValue.(type) {
-	case int32:
-		if val, ok := utils.ToInt64(ruleValue); ok {
-			return int32(val), true
-		}
-		if val, ok := utils.ToInt64(ruleStr); ok {
-			return int32(val), true
-		}
-	case int64:
-		if val, ok := utils.ToInt64(ruleValue); ok {
-			return val, true
-		}
-		if val, ok := utils.ToInt64(ruleStr); ok {
-			return val, true
-		}
-	case float64:
-		if val, ok := utils.ToFloat64(ruleValue); ok {
-			return val, true
-		}
-		if val, ok := utils.ToFloat64(ruleStr); ok {
-			return val, true
-		}
-	case bool:
-		if val, ok := utils.ToBool(ruleValue); ok {
-			return val, true
-		}
-		if val, ok := utils.ToBool(ruleStr); ok {
-			return val, true
-		}
-	}
-
-	return nil, false
-}
-
-// compareConvertedValues compares values of the same type
-func compareConvertedValues(a, b interface{}, operator string) bool {
-	switch aVal := a.(type) {
-	case int32:
-		bVal := b.(int32)
-		return compareInt32(aVal, bVal, operator)
-	case int64:
-		bVal := b.(int64)
-		return compareInt64(aVal, bVal, operator)
-	case float64:
-		bVal := b.(float64)
-		return compareFloat64(aVal, bVal, operator)
-	case bool:
-		bVal := b.(bool)
-		return compareBool(aVal, bVal, operator)
-	default:
-		return false
-	}
-}
-
-// areTypesCompatible checks if two types can be meaningfully compared
-func areTypesCompatible(aType, bType reflect.Type) bool {
-	if aType == bType {
-		return true // Same types are always compatible
-	}
-
-	// Allow numeric type mixing (int, float)
-	if isNumericType(aType) && isNumericType(bType) {
-		return true
-	}
-
-	// Allow string comparisons with string-like types
-	if isStringType(aType) && isStringType(bType) {
-		return true
-	}
-
-	// All other combinations are incompatible
 	return false
 }
 
-// isNumericType checks if a reflect.Type represents a numeric type
-func isNumericType(t reflect.Type) bool {
-	if t == nil {
-		return false
+func isTextType(dataType uint32) bool {
+	return dataType == pgtype.TextOID || dataType == pgtype.VarcharOID || dataType == pgtype.BPCharOID
+}
+
+func isNumericType(dataType uint32) bool {
+	return dataType == pgtype.Int2OID || dataType == pgtype.Int4OID || dataType == pgtype.Int8OID ||
+		dataType == pgtype.Float4OID || dataType == pgtype.Float8OID || dataType == pgtype.NumericOID
+}
+
+func isTimeType(dataType uint32) bool {
+	return dataType == pgtype.TimestampOID || dataType == pgtype.TimestamptzOID || dataType == pgtype.DateOID
+}
+
+func isBoolType(dataType uint32) bool {
+	return dataType == pgtype.BoolOID
+}
+
+// isRuleValueCompatibleWithColumn checks if a rule value is compatible with a column type
+func isRuleValueCompatibleWithColumn(ruleValue string, columnDataType uint32) bool {
+	// Detect the rule value type based on content
+	if isBooleanRuleValue(ruleValue) {
+		return isBoolType(columnDataType) // Strict: boolean rules only work with boolean columns
 	}
-	switch t.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
+	if isNumericRuleValue(ruleValue) {
+		return isNumericType(columnDataType) || isTextType(columnDataType) // Allow numeric rules with text containing numbers
+	}
+	if isTimeRuleValue(ruleValue) {
+		return isTimeType(columnDataType) || isTextType(columnDataType) // Allow time rules with text containing timestamps
+	}
+	// String values are compatible with most types (except boolean, which is strict)
+	return !isBoolType(columnDataType)
+}
+
+func isBooleanRuleValue(s string) bool {
+	switch strings.ToLower(s) {
+	case "true", "false":
 		return true
 	default:
 		return false
 	}
 }
 
-// isStringType checks if a reflect.Type represents a string-like type
-func isStringType(t reflect.Type) bool {
-	if t == nil {
-		return false
-	}
-	return t.Kind() == reflect.String
+func isNumericRuleValue(s string) bool {
+	_, err := strconv.ParseFloat(s, 64)
+	return err == nil
 }
 
-// isNumeric checks if a value is a numeric type
-func isNumeric(v interface{}) bool {
-	switch v.(type) {
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-		return true
-	default:
-		return false
-	}
+func isTimeRuleValue(s string) bool {
+	_, err := parseBasicTime(s)
+	return err == nil
 }
 
-// convertToFloat64 safely converts various numeric types to float64
-func convertToFloat64(v interface{}) (float64, bool) {
-	switch val := v.(type) {
-	case int:
-		return float64(val), true
-	case int32:
-		return float64(val), true
-	case int64:
-		return float64(val), true
-	case float32:
-		return float64(val), true
-	case float64:
-		return val, true
-	default:
-		return 0, false
-	}
-}
+func compareBooleanStrings(a, b, operator string) bool {
+	aBool := postgresStringToBool(a)
+	bBool := postgresStringToBool(b)
 
-// compareFloat64 compares two float64 values
-func compareFloat64(a, b float64, operator string) bool {
 	switch operator {
 	case "eq":
-		return a == b
+		return aBool == bBool
 	case "ne":
-		return a != b
-	case "gt":
-		return a > b
-	case "lt":
-		return a < b
-	case "gte":
-		return a >= b
-	case "lte":
-		return a <= b
-	default:
-		return false
-	}
-}
-
-// compareTime compares two time.Time values
-func compareTime(a, b time.Time, operator string) bool {
-	switch operator {
-	case "eq":
-		return a.Equal(b)
-	case "ne":
-		return !a.Equal(b)
-	case "gt":
-		return a.After(b)
-	case "lt":
-		return a.Before(b)
-	case "gte":
-		return a.After(b) || a.Equal(b)
-	case "lte":
-		return a.Before(b) || a.Equal(b)
-	default:
-		return false
-	}
-}
-
-// compareInt32 compares two int32 values
-func compareInt32(a, b int32, operator string) bool {
-	switch operator {
-	case "eq":
-		return a == b
-	case "ne":
-		return a != b
-	case "gt":
-		return a > b
-	case "lt":
-		return a < b
-	case "gte":
-		return a >= b
-	case "lte":
-		return a <= b
-	default:
-		return false
-	}
-}
-
-// compareInt64 compares two int64 values
-func compareInt64(a, b int64, operator string) bool {
-	switch operator {
-	case "eq":
-		return a == b
-	case "ne":
-		return a != b
-	case "gt":
-		return a > b
-	case "lt":
-		return a < b
-	case "gte":
-		return a >= b
-	case "lte":
-		return a <= b
-	default:
-		return false
-	}
-}
-
-// compareBool compares two boolean values
-func compareBool(a, b bool, operator string) bool {
-	switch operator {
-	case "eq":
-		return a == b
-	case "ne":
-		return a != b
+		return aBool != bBool
 	default:
 		return false // Boolean values don't have ordering
 	}
 }
 
-// compareStringValues compares two string values
-func compareStringValues(a, b string, operator string) bool {
+func postgresStringToBool(s string) bool {
+	switch strings.ToLower(s) {
+	case "t", "true", "1", "y", "yes", "on":
+		return true
+	case "f", "false", "0", "n", "no", "off":
+		return false
+	default:
+		return false
+	}
+}
+
+func compareNumericStrings(a, b, operator string) bool {
+	aFloat, aErr := strconv.ParseFloat(a, 64)
+	bFloat, bErr := strconv.ParseFloat(b, 64)
+
+	// If parsing fails, fall back to string comparison
+	if aErr != nil || bErr != nil {
+		if operator == "eq" {
+			return a == b
+		}
+		return compareLexicographic(a, b, operator)
+	}
+
 	switch operator {
 	case "eq":
-		return a == b
-	case "ne":
-		return a != b
+		return aFloat == bFloat
+	case "gt":
+		return aFloat > bFloat
+	case "lt":
+		return aFloat < bFloat
+	case "gte":
+		return aFloat >= bFloat
+	case "lte":
+		return aFloat <= bFloat
+	}
+	return false
+}
+
+func compareTimeStrings(a, b, operator string) bool {
+	aTime, aErr := parseBasicTime(a)
+	bTime, bErr := parseBasicTime(b)
+
+	if aErr == nil && bErr == nil {
+		switch operator {
+		case "eq":
+			return aTime.Equal(bTime)
+		case "gt":
+			return aTime.After(bTime)
+		case "lt":
+			return aTime.Before(bTime)
+		case "gte":
+			return aTime.After(bTime) || aTime.Equal(bTime)
+		case "lte":
+			return aTime.Before(bTime) || aTime.Equal(bTime)
+		}
+	}
+
+	return compareLexicographic(a, b, operator)
+}
+
+func parseBasicTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05-07:00", s); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("not a basic time format: %s", s)
+}
+
+func compareLexicographic(a, b, operator string) bool {
+	switch operator {
 	case "gt":
 		return a > b
 	case "lt":
@@ -546,53 +448,28 @@ func compareStringValues(a, b string, operator string) bool {
 		return a >= b
 	case "lte":
 		return a <= b
-	default:
-		return false
 	}
+	return false
 }
 
-// compareDecimalValues compares two decimal values directly - no string conversion
-func compareDecimalValues(a, b decimal.Decimal, operator string) bool {
-	switch operator {
-	case "eq":
-		return a.Equal(b)
-	case "ne":
-		return !a.Equal(b)
-	case "gt":
-		return a.GreaterThan(b)
-	case "lt":
-		return a.LessThan(b)
-	case "gte":
-		return a.GreaterThanOrEqual(b)
-	case "lte":
-		return a.LessThanOrEqual(b)
-	default:
+func shouldApplyRule(operations []utils.OperationType, allowEmptyDeletes bool, messageType utils.OperationType) bool {
+	if !containsOperation(operations, messageType) {
 		return false
 	}
+	return !(messageType == utils.OperationDelete && allowEmptyDeletes)
 }
 
 // Apply applies the transform rule to the provided data
 func (r *TransformRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error) {
-	if !containsOperation(r.Operations, message.Type) {
+	if !shouldApplyRule(r.Operations, r.AllowEmptyDeletes, message.Type) {
 		return message, nil
 	}
-
-	// Don't apply rule if asked not to
-	if message.Type == utils.OperationDelete && r.AllowEmptyDeletes {
-		return message, nil
-	}
-
 	return r.Transform(message)
 }
 
 // Apply applies the filter rule to the provided data
 func (r *FilterRule) Apply(message *utils.CDCMessage) (*utils.CDCMessage, error) {
-	if !containsOperation(r.Operations, message.Type) {
-		return message, nil
-	}
-
-	// Don't apply rule if asked not to
-	if message.Type == utils.OperationDelete && r.AllowEmptyDeletes {
+	if !shouldApplyRule(r.Operations, r.AllowEmptyDeletes, message.Type) {
 		return message, nil
 	}
 
