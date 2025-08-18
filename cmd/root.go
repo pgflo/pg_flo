@@ -1,3 +1,4 @@
+// Package cmd provides the command line interface for pg_flo.
 package cmd
 
 import (
@@ -81,6 +82,7 @@ var (
 	}
 )
 
+// Execute runs the root command for pg_flo
 func Execute() error {
 	return rootCmd.Execute()
 }
@@ -240,7 +242,13 @@ func runReplicator(_ *cobra.Command, _ []string) {
 
 	config := replicator.Config{
 		Host:     viper.GetString("host"),
-		Port:     uint16(viper.GetInt("port")),
+		Port:     func() uint16 {
+			port := viper.GetInt("port")
+			if port < 0 || port > 65535 {
+				log.Fatal().Msgf("Invalid port number: %d (must be 0-65535)", port)
+			}
+			return uint16(port)
+		}(),
 		Database: viper.GetString("dbname"),
 		User:     viper.GetString("user"),
 		Password: viper.GetString("password"),
@@ -428,7 +436,7 @@ func runWorker(cmd *cobra.Command, _ []string) {
 
 func loadRulesConfig(filePath string) (rules.Config, error) {
 	var config rules.Config
-	data, err := os.ReadFile(filePath)
+	data, err := os.ReadFile(filePath) // #nosec G304 - file path comes from command line argument
 	if err != nil {
 		return config, fmt.Errorf("failed to read config file: %w", err)
 	}
@@ -441,7 +449,7 @@ func loadRulesConfig(filePath string) (rules.Config, error) {
 
 func loadRoutingConfig(filePath string) (map[string]routing.TableRoute, error) {
 	var config map[string]routing.TableRoute
-	data, err := os.ReadFile(filePath)
+	data, err := os.ReadFile(filePath) // #nosec G304 - file path comes from command line argument
 	if err != nil {
 		return config, fmt.Errorf("failed to read routing config file: %w", err)
 	}

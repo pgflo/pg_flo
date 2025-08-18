@@ -60,7 +60,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 
 		mockTx.On("QueryRow", mock.Anything, "SELECT schemaname FROM pg_tables WHERE tablename = $1", mock.Anything).Return(MockRow{
 			scanFunc: func(dest ...interface{}) error {
-				*dest[0].(*string) = "public"
+				*dest[0].(*string) = replicator.DefaultSchema
 				return nil
 			},
 		})
@@ -85,7 +85,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 			BaseReplicator: replicator.NewBaseReplicator(
 				replicator.Config{
 					Tables:   []string{"users"},
-					Schema:   "public",
+					Schema:   replicator.DefaultSchema,
 					Host:     "localhost",
 					Port:     5432,
 					User:     "testuser",
@@ -134,7 +134,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 
 		mockTx.On("QueryRow", mock.Anything, "SELECT schemaname FROM pg_tables WHERE tablename = $1", mock.Anything).Return(MockRow{
 			scanFunc: func(dest ...interface{}) error {
-				*dest[0].(*string) = "public"
+				*dest[0].(*string) = replicator.DefaultSchema
 				return nil
 			},
 		})
@@ -176,7 +176,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 			BaseReplicator: replicator.NewBaseReplicator(
 				replicator.Config{
 					Tables:   []string{"users"},
-					Schema:   "public",
+					Schema:   replicator.DefaultSchema,
 					Host:     "localhost",
 					Port:     5432,
 					User:     "testuser",
@@ -203,12 +203,6 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 		mockPKRows.AssertExpectations(t)
 	})
 	t.Run("CopyTableRange with diverse data types", func(t *testing.T) {
-		type expected struct {
-			name  string
-			value string
-			oid   string
-			tuple string
-		}
 		testCases := []struct {
 			name           string
 			relationFields []pgconn.FieldDescription
@@ -287,7 +281,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 				mockTx.On("Exec", mock.Anything, mock.AnythingOfType("string"), mock.Anything).Return(pgconn.CommandTag{}, nil)
 				mockTx.On("QueryRow", mock.Anything, mock.AnythingOfType("string"), mock.Anything).Return(MockRow{
 					scanFunc: func(dest ...interface{}) error {
-						*dest[0].(*string) = "public"
+						*dest[0].(*string) = replicator.DefaultSchema
 						return nil
 					},
 				})
@@ -337,7 +331,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 					BaseReplicator: replicator.NewBaseReplicator(
 						replicator.Config{
 							Tables:   []string{"test_table"},
-							Schema:   "public",
+							Schema:   replicator.DefaultSchema,
 							Host:     "localhost",
 							Port:     5432,
 							User:     "testuser",

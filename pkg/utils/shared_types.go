@@ -4,19 +4,26 @@ package utils
 type OperationType string
 
 const (
+	// OperationInsert represents an INSERT database operation
 	OperationInsert OperationType = "INSERT"
+	// OperationUpdate represents an UPDATE database operation
 	OperationUpdate OperationType = "UPDATE"
+	// OperationDelete represents a DELETE database operation
 	OperationDelete OperationType = "DELETE"
-	OperationDDL    OperationType = "DDL"
+	// OperationDDL represents a DDL (Data Definition Language) database operation
+	OperationDDL OperationType = "DDL"
 )
 
 // ReplicationKeyType represents the type of replication key
 type ReplicationKeyType string
 
 const (
-	ReplicationKeyPK     ReplicationKeyType = "PRIMARY KEY"
+	// ReplicationKeyPK represents a primary key replication identifier
+	ReplicationKeyPK ReplicationKeyType = "PRIMARY KEY"
+	// ReplicationKeyUnique represents a unique constraint replication identifier
 	ReplicationKeyUnique ReplicationKeyType = "UNIQUE"
-	ReplicationKeyFull   ReplicationKeyType = "FULL" // Replica identity full
+	// ReplicationKeyFull represents a full table replication identifier (replica identity full)
+	ReplicationKeyFull ReplicationKeyType = "FULL"
 )
 
 // ReplicationKey represents a key used for replication (either PK or unique constraint)
@@ -25,6 +32,7 @@ type ReplicationKey struct {
 	Columns []string
 }
 
+// Logger defines the interface for logging operations
 type Logger interface {
 	Debug() LogEvent
 	Info() LogEvent
@@ -33,6 +41,7 @@ type Logger interface {
 	Err(err error) LogEvent
 }
 
+// LogEvent defines the interface for individual log events
 type LogEvent interface {
 	Str(key, val string) LogEvent
 	Int(key string, val int) LogEvent

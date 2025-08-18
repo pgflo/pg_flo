@@ -74,7 +74,11 @@ func (s *WebhookSink) sendWithRetry(jsonData []byte) error {
 			log.Warn().Err(err).Int("attempt", attempt).Msg("Webhook request failed, retrying...")
 			continue
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				log.Warn().Err(err).Msg("Failed to close response body")
+			}
+		}()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil

@@ -1,3 +1,4 @@
+// Package pgflonats provides NATS integration for PostgreSQL replication state management.
 package pgflonats
 
 import (

@@ -6,16 +6,19 @@ import (
 	"github.com/jackc/pglogrepl"
 )
 
+// StreamReplicator handles PostgreSQL logical replication streaming
 type StreamReplicator struct {
 	*BaseReplicator
 }
 
+// NewStreamReplicator creates a new stream replicator instance
 func NewStreamReplicator(base *BaseReplicator) *StreamReplicator {
 	return &StreamReplicator{
 		BaseReplicator: base,
 	}
 }
 
+// Start begins the stream replication process
 func (r *StreamReplicator) Start(ctx context.Context) error {
 	if err := r.BaseReplicator.Start(ctx); err != nil {
 		return err
@@ -42,6 +45,7 @@ func (r *StreamReplicator) Start(ctx context.Context) error {
 	}
 }
 
+// Stop stops the stream replicator
 func (r *StreamReplicator) Stop(ctx context.Context) error {
 	return r.BaseReplicator.Stop(ctx)
 }

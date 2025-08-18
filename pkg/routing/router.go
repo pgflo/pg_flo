@@ -1,3 +1,4 @@
+// Package routing provides message routing capabilities for pg_flo.
 package routing
 
 import (
@@ -9,11 +10,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// ColumnMapping defines how columns are mapped between source and destination
 type ColumnMapping struct {
 	Source      string `yaml:"source"`
 	Destination string `yaml:"destination"`
 }
 
+// TableRoute defines routing configuration for a specific table
 type TableRoute struct {
 	SourceTable      string                `yaml:"source_table"`
 	DestinationTable string                `yaml:"destination_table"`
@@ -21,12 +24,14 @@ type TableRoute struct {
 	Operations       []utils.OperationType `yaml:"operations"`
 }
 
+// Router manages message routing and transformation
 type Router struct {
 	Routes map[string]TableRoute
 	mutex  sync.RWMutex
 	logger zerolog.Logger
 }
 
+// NewRouter creates a new Router instance
 func NewRouter() *Router {
 	return &Router{
 		Routes: make(map[string]TableRoute),
@@ -34,12 +39,14 @@ func NewRouter() *Router {
 	}
 }
 
+// AddRoute adds a new table route to the router
 func (r *Router) AddRoute(route TableRoute) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.Routes[route.SourceTable] = route
 }
 
+// ApplyRouting applies routing rules to transform a CDC message
 func (r *Router) ApplyRouting(message *utils.CDCMessage) (*utils.CDCMessage, error) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()

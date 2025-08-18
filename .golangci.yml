@@ -1,32 +1,58 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  build-tags: []
+  go: "1.24"
+
 linters:
   enable:
-    - gofmt
-    - goimports
     - govet
     - errcheck
     - staticcheck
     - ineffassign
     - unconvert
     - misspell
-    - gosec
+    - unused
+    - gocyclo
+    - goconst
     - revive
+    - gosec
+  disable:
+    - dupl # Disabled: test code duplication is acceptable
 
 linters-settings:
   govet:
-    # Check-shadowing option removed
+    enable:
+      - shadow
+      - printf
+      - shift
+      - unreachable
+
   revive:
-    min-confidence: 0.8
+    confidence: 0.8
+
   gocyclo:
     min-complexity: 15
-  maligned:
-    suggest-new: true
-  dupl:
-    threshold: 100
+
   goconst:
     min-len: 2
     min-occurrences: 2
 
+  dupl:
+    threshold: 100
+
+  gosec:
+    excludes: []
+    severity: "medium"
+    confidence: "medium"
+
 issues:
+  max-issues-per-linter: 0
+
+  max-same-issues: 0
+
   exclude-rules:
     - path: _test\.go
       linters:
@@ -34,12 +60,29 @@ issues:
         - errcheck
         - dupl
         - gosec
+        - goconst
+        - unused
+
+    - path: _test\.go
+      linters:
+        - revive
+      text: "unused-parameter"
+
+    - linters:
+        - lll
+      source: "^//go:generate "
+
   exclude-dirs:
     - vendor/
+    - bin/
+
   exclude-files:
-    - ".*_test.go"
+    - ".*\\.pb\\.go$"
 
 output:
-  formats: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+      colors: true

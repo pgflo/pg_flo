@@ -6,8 +6,11 @@ import (
 )
 
 var (
+	// ErrReplicatorAlreadyStarted is returned when attempting to start an already running replicator
 	ErrReplicatorAlreadyStarted = errors.New("replicator already started")
+	// ErrReplicatorNotStarted is returned when attempting to stop a non-running replicator
 	ErrReplicatorNotStarted     = errors.New("replicator not started")
+	// ErrReplicatorAlreadyStopped is returned when attempting to stop an already stopped replicator
 	ErrReplicatorAlreadyStopped = errors.New("replicator already stopped")
 )
 
