@@ -51,6 +51,16 @@ func (m *MockReplicationConnection) SendStandbyStatusUpdate(ctx context.Context,
 	return args.Error(0)
 }
 
+func (m *MockReplicationConnection) Reconnect(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *MockReplicationConnection) IsHealthy(ctx context.Context) bool {
+	args := m.Called(ctx)
+	return args.Bool(0)
+}
+
 type MockStandardConnection struct {
 	mock.Mock
 }

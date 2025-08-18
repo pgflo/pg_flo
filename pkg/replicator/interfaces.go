@@ -21,10 +21,12 @@ type Replicator interface {
 type ReplicationConnection interface {
 	Connect(ctx context.Context) error
 	Close(ctx context.Context) error
+	Reconnect(ctx context.Context) error
 	CreateReplicationSlot(ctx context.Context, slotName string) (pglogrepl.CreateReplicationSlotResult, error)
 	StartReplication(ctx context.Context, slotName string, startLSN pglogrepl.LSN, options pglogrepl.StartReplicationOptions) error
 	ReceiveMessage(ctx context.Context) (pgproto3.BackendMessage, error)
 	SendStandbyStatusUpdate(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error
+	IsHealthy(ctx context.Context) bool
 }
 
 // StandardConnection defines the interface for standard PostgreSQL connections

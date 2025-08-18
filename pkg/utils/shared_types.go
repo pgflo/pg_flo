@@ -1,4 +1,4 @@
-package utils
+package utils //nolint:revive // utils is a standard package name
 
 // OperationType represents the type of database operation
 type OperationType string

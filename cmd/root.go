@@ -15,6 +15,7 @@ import (
 	"github.com/pgflo/pg_flo/pkg/routing"
 	"github.com/pgflo/pg_flo/pkg/rules"
 	"github.com/pgflo/pg_flo/pkg/sinks"
+	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/pgflo/pg_flo/pkg/worker"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -139,6 +140,9 @@ func addReplicatorFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("copy", false, "Enable copy mode without streaming")
 	cmd.Flags().Int("max-copy-workers-per-table", 4, "Maximum number of copy workers per table (env: PG_FLO_MAX_COPY_WORKERS_PER_TABLE)")
 	cmd.Flags().Bool("track-ddl", false, "Enable tracking of DDL changes (env: PG_FLO_TRACK_DDL)")
+	cmd.Flags().Int("retry-max-attempts", 3, "Maximum number of retry attempts for connection errors (env: PG_FLO_RETRY_MAX_ATTEMPTS)")
+	cmd.Flags().Duration("retry-initial-wait", 1*time.Second, "Initial wait time between retry attempts (env: PG_FLO_RETRY_INITIAL_WAIT)")
+	cmd.Flags().Duration("retry-max-wait", 8*time.Second, "Maximum wait time between retry attempts (env: PG_FLO_RETRY_MAX_WAIT)")
 }
 
 func initConfig() {
@@ -241,8 +245,8 @@ func runReplicator(_ *cobra.Command, _ []string) {
 	}
 
 	config := replicator.Config{
-		Host:     viper.GetString("host"),
-		Port:     func() uint16 {
+		Host: viper.GetString("host"),
+		Port: func() uint16 {
 			port := viper.GetInt("port")
 			if port < 0 || port > 65535 {
 				log.Fatal().Msgf("Invalid port number: %d (must be 0-65535)", port)
@@ -256,6 +260,11 @@ func runReplicator(_ *cobra.Command, _ []string) {
 		Schema:   viper.GetString("schema"),
 		Tables:   viper.GetStringSlice("tables"),
 		TrackDDL: viper.GetBool("track-ddl"),
+		RetryConfig: utils.RetryConfig{
+			MaxAttempts: viper.GetInt("retry-max-attempts"),
+			InitialWait: viper.GetDuration("retry-initial-wait"),
+			MaxWait:     viper.GetDuration("retry-max-wait"),
+		},
 	}
 
 	natsURL := viper.GetString("nats-url")

@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/rs/zerolog/log"
@@ -202,15 +205,126 @@ func (r *BaseReplicator) StreamChanges(ctx context.Context, stopChan <-chan stru
 	}
 }
 
-// ProcessNextMessage handles the next replication message
+func (r *BaseReplicator) isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "unexpected EOF") {
+		return true
+	}
+
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	var pgconnErr *pgconn.ConnectError
+	if errors.As(err, &pgconnErr) {
+		return true
+	}
+
+	errMsg := strings.ToLower(err.Error())
+	connectionErrors := []string{
+		"connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"no route to host",
+		"connection timed out",
+		"server closed the connection unexpectedly",
+		"connection to server",
+		"could not connect to server",
+	}
+
+	for _, connErr := range connectionErrors {
+		if strings.Contains(errMsg, connErr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (r *BaseReplicator) reconnectAndStartReplication(ctx context.Context) error {
+	r.Logger.Info().Msg("Attempting to reconnect replication connection")
+
+	if err := r.ReplicationConn.Reconnect(ctx); err != nil {
+		return fmt.Errorf("failed to reconnect: %w", err)
+	}
+
+	publicationName := GeneratePublicationName(r.Config.Group)
+
+	slotStatusErr := r.CheckReplicationSlotStatus(ctx)
+	if slotStatusErr != nil {
+		if strings.Contains(slotStatusErr.Error(), "not found") {
+			r.Logger.Warn().Str("slotName", publicationName).Msg("Replication slot missing, attempting to recreate")
+			if err := r.CreateReplicationSlot(ctx); err != nil {
+				return fmt.Errorf("failed to recreate missing replication slot: %w", err)
+			}
+			r.Logger.Info().Str("slotName", publicationName).Msg("Replication slot recreated successfully")
+		} else {
+			r.Logger.Warn().Err(slotStatusErr).Msg("Non-critical replication slot status issue")
+		}
+	}
+
+	startLSN := r.LastLSN
+	if startLSN == 0 {
+		lastLSN, err := r.GetLastState()
+		if err != nil {
+			r.Logger.Warn().Err(err).Msg("Failed to get last state, starting from 0")
+			startLSN = 0
+		} else {
+			startLSN = lastLSN
+		}
+	}
+
+	r.Logger.Info().Str("startLSN", startLSN.String()).Str("publication", publicationName).Msg("Restarting replication after reconnection")
+
+	return r.ReplicationConn.StartReplication(ctx, publicationName, startLSN, pglogrepl.StartReplicationOptions{
+		PluginArgs: []string{
+			"proto_version '1'",
+			fmt.Sprintf("publication_names '%s'", publicationName),
+		},
+	})
+}
+
+// ProcessNextMessage handles the next replication message with retry logic for connection errors
 func (r *BaseReplicator) ProcessNextMessage(ctx context.Context, lastStatusUpdate *time.Time, standbyMessageTimeout time.Duration) error {
-	msg, err := r.ReplicationConn.ReceiveMessage(ctx)
+	retryConfig := r.Config.GetRetryConfig()
+
+	var msg pgproto3.BackendMessage
+	var err error
+
+	err = utils.WithRetry(ctx, retryConfig, func() error {
+		msg, err = r.ReplicationConn.ReceiveMessage(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
+
+			if r.isConnectionError(err) {
+				r.Logger.Warn().Err(err).Msg("Connection error detected, attempting recovery")
+
+				if reconnectErr := r.reconnectAndStartReplication(ctx); reconnectErr != nil {
+					r.Logger.Error().Err(reconnectErr).Msg("Failed to reconnect and restart replication")
+					return reconnectErr
+				}
+
+				r.Logger.Info().Msg("Successfully reconnected and restarted replication")
+				return err
+			}
+
+			return err
+		}
+		return nil
+	})
+
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			r.Logger.Debug().Msg("Context canceled or deadline exceeded, stopping message processing")
 			return nil
 		}
-		r.Logger.Error().Err(err).Msg("Error processing next message")
+		r.Logger.Error().Err(err).Msg("Error processing next message after retries")
 		return err
 	}
 
@@ -571,17 +685,34 @@ func (r *BaseReplicator) GetLastState() (pglogrepl.LSN, error) {
 	return state.LSN, nil
 }
 
-// CheckReplicationSlotStatus checks the status of the replication slot
+// CheckReplicationSlotStatus checks the status of the replication slot and validates it for reconnection
 func (r *BaseReplicator) CheckReplicationSlotStatus(ctx context.Context) error {
 	publicationName := GeneratePublicationName(r.Config.Group)
+
 	var restartLSN string
+	var active bool
+	var confirmedFlushLSN string
+
 	err := r.StandardConn.QueryRow(ctx,
-		"SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = $1",
-		publicationName).Scan(&restartLSN)
+		`SELECT restart_lsn, active, confirmed_flush_lsn
+		 FROM pg_replication_slots
+		 WHERE slot_name = $1`,
+		publicationName).Scan(&restartLSN, &active, &confirmedFlushLSN)
+
 	if err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return fmt.Errorf("replication slot %s not found: %w", publicationName, err)
+		}
 		return fmt.Errorf("failed to query replication slot status: %w", err)
 	}
-	r.Logger.Info().Str("slotName", publicationName).Str("restartLSN", restartLSN).Msg("Replication slot status")
+
+	r.Logger.Info().
+		Str("slotName", publicationName).
+		Str("restartLSN", restartLSN).
+		Str("confirmedFlushLSN", confirmedFlushLSN).
+		Any("active", active).
+		Msg("Replication slot status")
+
 	return nil
 }
 

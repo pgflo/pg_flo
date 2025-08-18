@@ -71,3 +71,20 @@ func (rc *PostgresReplicationConnection) ReceiveMessage(ctx context.Context) (pg
 func (rc *PostgresReplicationConnection) SendStandbyStatusUpdate(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error {
 	return pglogrepl.SendStandbyStatusUpdate(ctx, rc.Conn, status)
 }
+
+// Reconnect closes the existing connection and establishes a new one
+func (rc *PostgresReplicationConnection) Reconnect(ctx context.Context) error {
+	if rc.Conn != nil {
+		_ = rc.Conn.Close(ctx)
+		rc.Conn = nil
+	}
+	return rc.Connect(ctx)
+}
+
+// IsHealthy checks if the connection is healthy
+func (rc *PostgresReplicationConnection) IsHealthy(ctx context.Context) bool { //nolint:revive // ctx required by interface
+	if rc.Conn == nil {
+		return false
+	}
+	return !rc.Conn.IsClosed()
+}
