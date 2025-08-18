@@ -15,6 +15,11 @@ copy-and-stream: false # Enable copy and stream mode (env: PG_FLO_COPY_AND_STREA
 max-copy-workers-per-table: 4 # Maximum number of parallel workers for copy operation (env: PG_FLO_MAX_COPY_WORKERS_PER_TABLE)
 track-ddl: false # Enable tracking of DDL changes (env: PG_FLO_TRACK_DDL)
 
+# Connection retry settings
+retry-max-attempts: 3 # Maximum number of retry attempts for connection errors (env: PG_FLO_RETRY_MAX_ATTEMPTS)
+retry-initial-wait: "1s" # Initial wait time between retry attempts (env: PG_FLO_RETRY_INITIAL_WAIT)
+retry-max-wait: "8s" # Maximum wait time between retry attempts (env: PG_FLO_RETRY_MAX_WAIT)
+
 # NATS settings
 nats-url: "nats://localhost:4222" # NATS server URL (env: PG_FLO_NATS_URL)
 

@@ -1,5 +1,5 @@
 // Package utils provides common utilities and data structures for pg_flo.
-package utils
+package utils //nolint:revive // utils is a standard package name
 
 import (
 	"encoding/gob"

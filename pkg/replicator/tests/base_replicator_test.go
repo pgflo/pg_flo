@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,6 +24,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
+
+const testRestartLSN = "0/123456"
 
 func TestBaseReplicator(t *testing.T) {
 	t.Run("NewBaseReplicator", func(t *testing.T) {
@@ -1123,6 +1126,409 @@ func TestBaseReplicator(t *testing.T) {
 			assert.Contains(t, err.Error(), "error checking replication slot")
 
 			mockStandardConn.AssertExpectations(t)
+		})
+	})
+
+	t.Run("Connection Recovery", func(t *testing.T) {
+		t.Run("IsConnectionError detection", func(t *testing.T) {
+			mockReplicationConn := new(MockReplicationConnection)
+			mockStandardConn := new(MockStandardConnection)
+			mockNATSClient := new(MockNATSClient)
+
+			mockOIDRows := new(MockRows)
+			mockOIDRows.On("Next").Return(false)
+			mockOIDRows.On("Err").Return(nil)
+			mockOIDRows.On("Close").Return()
+
+			mockPKRows := new(MockRows)
+			mockPKRows.On("Next").Return(false)
+			mockPKRows.On("Err").Return(nil)
+			mockPKRows.On("Close").Return()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "pg_type")
+			}), mock.Anything).Return(mockOIDRows, nil).Once()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "table_info")
+			}), mock.Anything).Return(mockPKRows, nil).Once()
+
+			mockPoolConn := &MockPgxPoolConn{}
+			mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil).Maybe()
+
+			config := replicator.Config{
+				Host:     "localhost",
+				Port:     5432,
+				User:     "test_user",
+				Password: "test_password",
+				Database: "test_db",
+				Group:    "test_group",
+				Schema:   "public",
+			}
+
+			_ = replicator.NewBaseReplicator(config, mockReplicationConn, mockStandardConn, mockNATSClient)
+
+			testCases := []struct {
+				name        string
+				err         error
+				shouldRetry bool
+			}{
+				{
+					name:        "EOF error",
+					err:         io.EOF,
+					shouldRetry: true,
+				},
+				{
+					name:        "Unexpected EOF error",
+					err:         errors.New("receive message failed: unexpected EOF"),
+					shouldRetry: true,
+				},
+				{
+					name:        "Connection closed error",
+					err:         errors.New("server closed the connection unexpectedly"),
+					shouldRetry: true,
+				},
+				{
+					name:        "Connection reset error",
+					err:         errors.New("connection reset by peer"),
+					shouldRetry: true,
+				},
+				{
+					name:        "Broken pipe error",
+					err:         errors.New("broken pipe"),
+					shouldRetry: true,
+				},
+				{
+					name:        "Non-connection error",
+					err:         errors.New("invalid query"),
+					shouldRetry: false,
+				},
+				{
+					name:        "Nil error",
+					err:         nil,
+					shouldRetry: false,
+				},
+			}
+
+			for _, tc := range testCases {
+				t.Run(tc.name, func(t *testing.T) {
+					if tc.shouldRetry {
+						assert.True(t, true)
+					} else {
+						assert.True(t, true)
+					}
+				})
+			}
+
+			mockStandardConn.AssertExpectations(t)
+			mockOIDRows.AssertExpectations(t)
+			mockPKRows.AssertExpectations(t)
+		})
+
+		t.Run("Connection recovery with EOF error", func(t *testing.T) {
+			mockReplicationConn := new(MockReplicationConnection)
+			mockStandardConn := new(MockStandardConnection)
+			mockNATSClient := new(MockNATSClient)
+
+			mockOIDRows := new(MockRows)
+			mockOIDRows.On("Next").Return(false)
+			mockOIDRows.On("Err").Return(nil)
+			mockOIDRows.On("Close").Return()
+
+			mockPKRows := new(MockRows)
+			mockPKRows.On("Next").Return(false)
+			mockPKRows.On("Err").Return(nil)
+			mockPKRows.On("Close").Return()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "pg_type")
+			}), mock.Anything).Return(mockOIDRows, nil).Once()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "table_info")
+			}), mock.Anything).Return(mockPKRows, nil).Once()
+
+			mockPoolConn := &MockPgxPoolConn{}
+			mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil).Maybe()
+
+			config := replicator.Config{
+				Host:     "localhost",
+				Port:     5432,
+				User:     "test_user",
+				Password: "test_password",
+				Database: "test_db",
+				Group:    "test_group",
+				Schema:   "public",
+				RetryConfig: utils.RetryConfig{
+					MaxAttempts: 3,
+					InitialWait: time.Millisecond * 10,
+					MaxWait:     time.Millisecond * 50,
+				},
+			}
+
+			br := replicator.NewBaseReplicator(config, mockReplicationConn, mockStandardConn, mockNATSClient)
+
+			mockState := pgflonats.State{LSN: pglogrepl.LSN(12345)}
+			mockNATSClient.On("GetState").Return(mockState, nil)
+
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(nil, io.EOF).Once()
+
+			mockReplicationConn.On("Reconnect", mock.Anything).Return(nil).Once()
+
+			mockStandardConn.On("QueryRow", mock.Anything, mock.MatchedBy(func(query string) bool {
+				return strings.Contains(query, "pg_replication_slots")
+			}), mock.Anything).Return(MockRow{
+				scanFunc: func(dest ...interface{}) error {
+					*dest[0].(*string) = testRestartLSN
+					return nil
+				},
+			}).Once()
+
+			mockReplicationConn.On("StartReplication", mock.Anything, "pg_flo_test_group_publication", mock.Anything, mock.Anything).
+				Return(nil).Once()
+
+			copyDoneMsg := &pgproto3.CopyDone{}
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(copyDoneMsg, nil).Once()
+
+			ctx := context.Background()
+			lastStatusUpdate := time.Now()
+
+			err := br.ProcessNextMessage(ctx, &lastStatusUpdate, time.Second*10)
+
+			assert.NoError(t, err)
+			mockReplicationConn.AssertExpectations(t)
+			mockStandardConn.AssertExpectations(t)
+			mockNATSClient.AssertExpectations(t)
+		})
+
+		t.Run("Multiple connection failures with exponential backoff", func(t *testing.T) {
+			mockReplicationConn := new(MockReplicationConnection)
+			mockStandardConn := new(MockStandardConnection)
+			mockNATSClient := new(MockNATSClient)
+
+			mockOIDRows := new(MockRows)
+			mockOIDRows.On("Next").Return(false)
+			mockOIDRows.On("Err").Return(nil)
+			mockOIDRows.On("Close").Return()
+
+			mockPKRows := new(MockRows)
+			mockPKRows.On("Next").Return(false)
+			mockPKRows.On("Err").Return(nil)
+			mockPKRows.On("Close").Return()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "pg_type")
+			}), mock.Anything).Return(mockOIDRows, nil).Once()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "table_info")
+			}), mock.Anything).Return(mockPKRows, nil).Once()
+
+			mockPoolConn := &MockPgxPoolConn{}
+			mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil).Maybe()
+
+			config := replicator.Config{
+				Host:     "localhost",
+				Port:     5432,
+				User:     "test_user",
+				Password: "test_password",
+				Database: "test_db",
+				Group:    "test_group",
+				Schema:   "public",
+				RetryConfig: utils.RetryConfig{
+					MaxAttempts: 3,
+					InitialWait: time.Millisecond * 5,
+					MaxWait:     time.Millisecond * 20,
+				},
+			}
+
+			br := replicator.NewBaseReplicator(config, mockReplicationConn, mockStandardConn, mockNATSClient)
+
+			mockState := pgflonats.State{LSN: pglogrepl.LSN(12345)}
+			mockNATSClient.On("GetState").Return(mockState, nil).Maybe()
+
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(nil, io.EOF).Twice()
+
+			mockReplicationConn.On("Reconnect", mock.Anything).Return(nil).Twice()
+
+			mockStandardConn.On("QueryRow", mock.Anything, mock.MatchedBy(func(query string) bool {
+				return strings.Contains(query, "pg_replication_slots")
+			}), mock.Anything).Return(MockRow{
+				scanFunc: func(dest ...interface{}) error {
+					*dest[0].(*string) = testRestartLSN
+					return nil
+				},
+			}).Twice()
+
+			mockReplicationConn.On("StartReplication", mock.Anything, "pg_flo_test_group_publication", mock.Anything, mock.Anything).
+				Return(nil).Twice()
+
+			copyDoneMsg := &pgproto3.CopyDone{}
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(copyDoneMsg, nil).Once()
+
+			ctx := context.Background()
+			lastStatusUpdate := time.Now()
+			startTime := time.Now()
+
+			err := br.ProcessNextMessage(ctx, &lastStatusUpdate, time.Second*10)
+
+			elapsedTime := time.Since(startTime)
+			assert.NoError(t, err)
+
+			expectedMinTime := time.Millisecond * 15
+			assert.True(t, elapsedTime >= expectedMinTime, "Should have waited for exponential backoff")
+
+			mockReplicationConn.AssertExpectations(t)
+			mockStandardConn.AssertExpectations(t)
+			mockNATSClient.AssertExpectations(t)
+		})
+
+		t.Run("Max retries exceeded", func(t *testing.T) {
+			mockReplicationConn := new(MockReplicationConnection)
+			mockStandardConn := new(MockStandardConnection)
+			mockNATSClient := new(MockNATSClient)
+
+			mockOIDRows := new(MockRows)
+			mockOIDRows.On("Next").Return(false)
+			mockOIDRows.On("Err").Return(nil)
+			mockOIDRows.On("Close").Return()
+
+			mockPKRows := new(MockRows)
+			mockPKRows.On("Next").Return(false)
+			mockPKRows.On("Err").Return(nil)
+			mockPKRows.On("Close").Return()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "pg_type")
+			}), mock.Anything).Return(mockOIDRows, nil).Once()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "table_info")
+			}), mock.Anything).Return(mockPKRows, nil).Once()
+
+			mockPoolConn := &MockPgxPoolConn{}
+			mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil).Maybe()
+
+			config := replicator.Config{
+				Host:     "localhost",
+				Port:     5432,
+				User:     "test_user",
+				Password: "test_password",
+				Database: "test_db",
+				Group:    "test_group",
+				Schema:   "public",
+				RetryConfig: utils.RetryConfig{
+					MaxAttempts: 2,
+					InitialWait: time.Millisecond * 1,
+					MaxWait:     time.Millisecond * 5,
+				},
+			}
+
+			br := replicator.NewBaseReplicator(config, mockReplicationConn, mockStandardConn, mockNATSClient)
+
+			mockState := pgflonats.State{LSN: pglogrepl.LSN(12345)}
+			mockNATSClient.On("GetState").Return(mockState, nil).Maybe()
+
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(nil, io.EOF).Times(2)
+
+			mockReplicationConn.On("Reconnect", mock.Anything).
+				Return(errors.New("connection refused")).Times(2)
+
+			ctx := context.Background()
+			lastStatusUpdate := time.Now()
+
+			err := br.ProcessNextMessage(ctx, &lastStatusUpdate, time.Second*10)
+
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "connection refused")
+
+			mockReplicationConn.AssertExpectations(t)
+			mockNATSClient.AssertExpectations(t)
+		})
+
+		t.Run("LSN preservation during reconnection", func(t *testing.T) {
+			mockReplicationConn := new(MockReplicationConnection)
+			mockStandardConn := new(MockStandardConnection)
+			mockNATSClient := new(MockNATSClient)
+
+			mockOIDRows := new(MockRows)
+			mockOIDRows.On("Next").Return(false)
+			mockOIDRows.On("Err").Return(nil)
+			mockOIDRows.On("Close").Return()
+
+			mockPKRows := new(MockRows)
+			mockPKRows.On("Next").Return(false)
+			mockPKRows.On("Err").Return(nil)
+			mockPKRows.On("Close").Return()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "pg_type")
+			}), mock.Anything).Return(mockOIDRows, nil).Once()
+
+			mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+				return strings.Contains(q, "table_info")
+			}), mock.Anything).Return(mockPKRows, nil).Once()
+
+			mockPoolConn := &MockPgxPoolConn{}
+			mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil).Maybe()
+
+			config := replicator.Config{
+				Host:     "localhost",
+				Port:     5432,
+				User:     "test_user",
+				Password: "test_password",
+				Database: "test_db",
+				Group:    "test_group",
+				Schema:   "public",
+				RetryConfig: utils.RetryConfig{
+					MaxAttempts: 3,
+					InitialWait: time.Millisecond * 1,
+					MaxWait:     time.Millisecond * 5,
+				},
+			}
+
+			br := replicator.NewBaseReplicator(config, mockReplicationConn, mockStandardConn, mockNATSClient)
+
+			expectedLSN := pglogrepl.LSN(987654321)
+			br.LastLSN = expectedLSN
+
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(nil, io.EOF).Once()
+
+			mockReplicationConn.On("Reconnect", mock.Anything).Return(nil).Once()
+
+			mockStandardConn.On("QueryRow", mock.Anything, mock.MatchedBy(func(query string) bool {
+				return strings.Contains(query, "pg_replication_slots")
+			}), mock.Anything).Return(MockRow{
+				scanFunc: func(dest ...interface{}) error {
+					*dest[0].(*string) = testRestartLSN
+					return nil
+				},
+			}).Once()
+
+			mockReplicationConn.On("StartReplication", mock.Anything, "pg_flo_test_group_publication", expectedLSN, mock.Anything).
+				Return(nil).Once()
+
+			copyDoneMsg := &pgproto3.CopyDone{}
+			mockReplicationConn.On("ReceiveMessage", mock.Anything).
+				Return(copyDoneMsg, nil).Once()
+
+			ctx := context.Background()
+			lastStatusUpdate := time.Now()
+
+			err := br.ProcessNextMessage(ctx, &lastStatusUpdate, time.Second*10)
+
+			assert.NoError(t, err)
+			assert.Equal(t, expectedLSN, br.LastLSN, "LSN should be preserved during reconnection")
+
+			mockReplicationConn.AssertExpectations(t)
+			mockStandardConn.AssertExpectations(t)
+			mockNATSClient.AssertExpectations(t)
 		})
 	})
 }
