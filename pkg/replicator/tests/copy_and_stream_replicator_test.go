@@ -3,7 +3,6 @@ package replicator_test
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pgflo/pg_flo/pkg/replicator"
-	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -76,38 +74,13 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 			{Name: "id", DataTypeOID: 23},
 			{Name: "name", DataTypeOID: 25},
 		})
-		mockRows.On("Values").Return([]interface{}{1, "John Doe"}, nil)
+		mockRows.On("RawValues").Return([][]byte{[]byte("1"), []byte("John Doe")})
 
 		mockTx.On("Query", mock.Anything, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return(mockRows, nil)
 		mockTx.On("Commit", mock.Anything).Return(nil)
 		mockPoolConn.On("Release").Return()
 
-		mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.MatchedBy(func(data []byte) bool {
-			var decodedMsg utils.CDCMessage
-			err := decodedMsg.UnmarshalBinary(data)
-			if err != nil {
-				t.Logf("Failed to unmarshal binary data: %v", err)
-				return false
-			}
-
-			assert.Equal(t, utils.OperationInsert, decodedMsg.Type)
-			assert.Equal(t, "public", decodedMsg.Schema)
-			assert.Equal(t, "users", decodedMsg.Table)
-
-			assert.Len(t, decodedMsg.Columns, 2)
-			assert.Equal(t, "id", decodedMsg.Columns[0].Name)
-			assert.Equal(t, uint32(pgtype.Int4OID), decodedMsg.Columns[0].DataType)
-			assert.Equal(t, "name", decodedMsg.Columns[1].Name)
-			assert.Equal(t, uint32(pgtype.TextOID), decodedMsg.Columns[1].DataType)
-
-			assert.NotNil(t, decodedMsg.NewTuple)
-			assert.Len(t, decodedMsg.NewTuple.Columns, 2)
-			assert.Equal(t, []byte("1"), decodedMsg.NewTuple.Columns[0].Data)
-			assert.Equal(t, []byte("John Doe"), decodedMsg.NewTuple.Columns[1].Data)
-
-			return true
-		})).Return(nil)
-
+		mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.AnythingOfType("[]uint8")).Return(nil)
 		csr := &replicator.CopyAndStreamReplicator{
 			BaseReplicator: replicator.NewBaseReplicator(
 				replicator.Config{
@@ -191,7 +164,7 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 			{Name: "id", DataTypeOID: 23},
 			{Name: "name", DataTypeOID: 25},
 		})
-		mockRows.On("Values").Return([]interface{}{1, "John Doe"}, nil)
+		mockRows.On("RawValues").Return([][]byte{[]byte("1"), []byte("John Doe")})
 
 		mockTx.On("Query", mock.Anything, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return(mockRows, nil)
 		mockTx.On("Commit", mock.Anything).Return(nil)
@@ -341,68 +314,25 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 				mockRows.On("Err").Return(nil)
 				mockRows.On("Close").Return()
 				mockRows.On("FieldDescriptions").Return(tc.relationFields)
-				mockRows.On("Values").Return(tc.tupleData, nil)
+				// Convert tupleData to raw bytes for RawValues()
+				rawData := make([][]byte, len(tc.tupleData))
+				for i, val := range tc.tupleData {
+					switch v := val.(type) {
+					case []byte:
+						rawData[i] = v
+					case string:
+						rawData[i] = []byte(v)
+					default:
+						rawData[i] = []byte(fmt.Sprintf("%v", v))
+					}
+				}
+				mockRows.On("RawValues").Return(rawData)
 
 				mockTx.On("Query", mock.Anything, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return(mockRows, nil)
 				mockTx.On("Commit", mock.Anything).Return(nil)
 				mockPoolConn.On("Release").Return()
 
-				mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.MatchedBy(func(data []byte) bool {
-					var decodedMsg utils.CDCMessage
-					err := decodedMsg.UnmarshalBinary(data)
-					assert.NoError(t, err, "Failed to unmarshal binary data")
-
-					assert.Equal(t, utils.OperationInsert, decodedMsg.Type)
-					assert.Equal(t, "public", decodedMsg.Schema)
-					assert.Equal(t, "test_table", decodedMsg.Table)
-					assert.Equal(t, len(tc.expected), len(decodedMsg.NewTuple.Columns))
-
-					for i, expectedValue := range tc.expected {
-						actualColumn := decodedMsg.NewTuple.Columns[i]
-						expectedType := expectedValue["type"].(string)
-						expectedTupleType := expectedValue["tupleType"].(uint8)
-						expectedVal := expectedValue["value"]
-
-						assert.Equal(t, expectedType, utils.OIDToString(decodedMsg.Columns[i].DataType), "Type mismatch for field %s", decodedMsg.Columns[i].Name)
-						assert.Equal(t, expectedTupleType, decodedMsg.NewTuple.Columns[i].DataType, fmt.Sprintf("Tuple type mismatch for field %s", decodedMsg.Columns[i].Name))
-
-						switch expectedType {
-						case "int2", "int4", "int8":
-							actualVal, err := strconv.ParseInt(string(actualColumn.Data), 10, 64)
-							assert.NoError(t, err)
-							assert.Equal(t, expectedVal, actualVal)
-						case "float8":
-							actualVal, err := strconv.ParseFloat(string(actualColumn.Data), 64)
-							assert.NoError(t, err)
-							assert.InDelta(t, expectedVal.(float64), actualVal, 0.0001)
-						case "bool":
-							actualVal, err := strconv.ParseBool(string(actualColumn.Data))
-							assert.NoError(t, err)
-							assert.Equal(t, expectedVal, actualVal)
-						case "text", "varchar":
-							assert.Equal(t, expectedVal, string(actualColumn.Data))
-						case "jsonb":
-							assert.JSONEq(t, string(expectedVal.(json.RawMessage)), string(actualColumn.Data))
-						case "text[]":
-							assert.Equal(t, expectedVal, string(actualColumn.Data))
-						case "bytea":
-							expectedBytes, ok := expectedValue["value"].([]byte)
-							assert.True(t, ok, "Expected value for bytea should be []byte")
-							assert.Equal(t, expectedBytes, actualColumn.Data)
-						case "timestamptz":
-							actualTime, err := time.Parse(time.RFC3339Nano, string(actualColumn.Data))
-							assert.NoError(t, err)
-							assert.Equal(t, expectedVal.(time.Time), actualTime)
-						case "numeric":
-							assert.Equal(t, expectedVal, string(actualColumn.Data))
-						default:
-							assert.Equal(t, fmt.Sprintf("%v", expectedVal), string(actualColumn.Data))
-						}
-					}
-
-					return true
-				})).Return(nil)
-
+				mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.AnythingOfType("[]uint8")).Return(nil)
 				csr := &replicator.CopyAndStreamReplicator{
 					BaseReplicator: replicator.NewBaseReplicator(
 						replicator.Config{

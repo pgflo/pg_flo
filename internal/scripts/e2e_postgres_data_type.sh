@@ -4,7 +4,7 @@ set -euo pipefail
 source "$(dirname "$0")/e2e_common.sh"
 
 create_test_table() {
-  log "Creating test table with various data types in source database..."
+  log "Creating test table with various data types including comprehensive array testing..."
 
   # Create required extensions
   run_sql "CREATE EXTENSION IF NOT EXISTS hstore;"
@@ -33,6 +33,15 @@ create_test_table() {
     array_text_data text[] NOT NULL,
     array_int_data integer[] NOT NULL,
     array_bytea_data bytea[] NOT NULL,
+    array_text_with_commas text[] NOT NULL,
+    array_text_with_quotes text[] NOT NULL,
+    array_text_empty text[] NOT NULL,
+    array_varchar varchar[] NOT NULL,
+    array_char char(1)[] NOT NULL,
+    array_bool boolean[] NOT NULL,
+    array_nested_int integer[][] NOT NULL,
+    array_with_nulls text[],
+    array_mixed_special text[] NOT NULL,
     numeric_data numeric(10, 2) NOT NULL,
     uuid_data uuid NOT NULL,
     inet_data inet NOT NULL,
@@ -83,6 +92,15 @@ insert_test_data() {
     array_text_data,
     array_int_data,
     array_bytea_data,
+    array_text_with_commas,
+    array_text_with_quotes,
+    array_text_empty,
+    array_varchar,
+    array_char,
+    array_bool,
+    array_nested_int,
+    array_with_nulls,
+    array_mixed_special,
     numeric_data,
     uuid_data,
     inet_data,
@@ -178,6 +196,15 @@ insert_test_data() {
       E'\\\\x010203'::bytea,
       E'\\\\x040506'::bytea
     ], -- array_bytea_data
+    ARRAY['hello world', 'test,value', 'another,item'], -- array_text_with_commas (commas in values)
+    ARRAY['hello\"world', 'test\\\\value'], -- array_text_with_quotes (quotes and backslashes)
+    ARRAY[]::text[], -- array_text_empty (empty array)
+    ARRAY['varchar1', 'varchar2']::varchar[], -- array_varchar
+    ARRAY['a', 'b', 'c']::char(1)[], -- array_char (char array - different OID)
+    ARRAY[true, false, true], -- array_bool (boolean array)
+    ARRAY[[1,2],[3,4]], -- array_nested_int (multidimensional - critical test)
+    ARRAY['value1', NULL, 'value3'], -- array_with_nulls (array with NULLs)
+    ARRAY['tab\tchar', 'newline\nchar', 'quote''test'], -- array_mixed_special (special characters)
     123.45, -- numeric_data
     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', -- uuid_data
     '192.168.0.1', -- inet_data

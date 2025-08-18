@@ -1,7 +1,9 @@
 package replicator
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"strings"
 	"sync"
@@ -416,10 +418,13 @@ func (r *BaseReplicator) HandleCommitMessage(msg *pglogrepl.CommitMessage) error
 
 // PublishToNATS publishes a message to NATS
 func (r *BaseReplicator) PublishToNATS(data utils.CDCMessage) error {
-	binaryData, err := data.MarshalBinary()
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data: %w", err)
 	}
+	binaryData := buf.Bytes()
 
 	subject := fmt.Sprintf("pgflo.%s", r.Config.Group)
 	err = r.NATSClient.PublishMessage(subject, binaryData)

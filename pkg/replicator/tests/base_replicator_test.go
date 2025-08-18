@@ -1,7 +1,9 @@
 package replicator_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"strconv"
@@ -807,7 +809,9 @@ func TestBaseReplicator(t *testing.T) {
 
 			mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.MatchedBy(func(data []byte) bool {
 				var decodedMsg utils.CDCMessage
-				err := decodedMsg.UnmarshalBinary(data)
+				decodeBuf := bytes.NewBuffer(data)
+				dec := gob.NewDecoder(decodeBuf)
+				err := dec.Decode(&decodedMsg)
 				if err != nil {
 					t.Logf("Failed to unmarshal binary data: %v", err)
 					return false
