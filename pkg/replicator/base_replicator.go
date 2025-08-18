@@ -1,3 +1,4 @@
+// Package replicator provides PostgreSQL replication functionality for pg_flo.
 package replicator
 
 import (
@@ -16,6 +17,11 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/rs/zerolog/log"
+)
+
+const (
+	// DefaultSchema is the default PostgreSQL schema name
+	DefaultSchema = "public"
 )
 
 // GeneratePublicationName generates a deterministic publication name based on the group name
@@ -47,7 +53,7 @@ type BaseReplicator struct {
 // NewBaseReplicator creates a new BaseReplicator instance
 func NewBaseReplicator(config Config, replicationConn ReplicationConnection, standardConn StandardConnection, natsClient NATSClient) *BaseReplicator {
 	if config.Schema == "" {
-		config.Schema = "public"
+		config.Schema = DefaultSchema
 	}
 
 	logger := utils.NewZerologLogger(log.With().Str("component", "replicator").Logger())

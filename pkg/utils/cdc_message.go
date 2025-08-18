@@ -1,3 +1,4 @@
+// Package utils provides common utilities and data structures for pg_flo.
 package utils
 
 import (
@@ -23,6 +24,7 @@ func init() {
 	gob.Register([][]byte{})
 }
 
+// ColumnNotFoundError is returned when a requested column is not found in the CDC message
 type ColumnNotFoundError struct {
 	ColumnName string
 }
@@ -42,6 +44,7 @@ type CDCMessage struct {
 	ToastedColumns map[string]bool
 }
 
+// GetColumnIndex returns the index of a column by name, or -1 if not found
 func (m *CDCMessage) GetColumnIndex(columnName string) int {
 	for i, col := range m.Columns {
 		if col.Name == columnName {

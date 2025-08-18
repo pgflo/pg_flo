@@ -77,6 +77,7 @@ func (s *StandardConnectionImpl) Acquire(ctx context.Context) (PgxPoolConn, erro
 	return &PgxPoolConnWrapper{Conn: conn}, nil
 }
 
+// PgxPoolConnWrapper wraps a pgxpool connection to implement the PgxPoolConn interface
 type PgxPoolConnWrapper struct {
 	*pgxpool.Conn
 }

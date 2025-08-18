@@ -13,6 +13,23 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const (
+	// OpEqual represents the equality comparison operator
+	OpEqual = "eq"
+	// OpNotEqual represents the not-equal comparison operator
+	OpNotEqual = "ne"
+	// OpGreaterThan represents the greater-than comparison operator
+	OpGreaterThan = "gt"
+	// OpLessThan represents the less-than comparison operator
+	OpLessThan = "lt"
+	// OpGreaterThanOrEqual represents the greater-than-or-equal comparison operator
+	OpGreaterThanOrEqual = "gte"
+	// OpLessThanOrEqual represents the less-than-or-equal comparison operator
+	OpLessThanOrEqual = "lte"
+	// OpContains represents the contains comparison operator
+	OpContains = "contains"
+)
+
 var logger zerolog.Logger
 
 func init() {
@@ -189,9 +206,9 @@ func NewFilterRule(table, column string, params map[string]interface{}) (Rule, e
 	var condition func(*utils.CDCMessage) bool
 
 	switch operator {
-	case "eq", "ne", "gt", "lt", "gte", "lte":
+	case OpEqual, OpNotEqual, OpGreaterThan, OpLessThan, OpGreaterThanOrEqual, OpLessThanOrEqual:
 		condition = NewComparisonCondition(column, operator, value)
-	case "contains":
+	case OpContains:
 		condition = NewContainsCondition(column, value)
 	default:
 		return nil, fmt.Errorf("unsupported operator: %s", operator)
@@ -212,6 +229,7 @@ func NewFilterRule(table, column string, params map[string]interface{}) (Rule, e
 	return rule, nil
 }
 
+// NewExcludeColumnRule creates a new exclude column rule for the specified table and column
 func NewExcludeColumnRule(table, column string) (Rule, error) {
 	rule := &ExcludeColumnRule{
 		TableName:  table,
@@ -263,7 +281,7 @@ func comparePostgreSQLValues(a, b, operator string, dataType uint32) bool {
 	}
 
 	switch operator {
-	case "eq":
+	case OpEqual:
 		// For numeric types, normalize values for comparison
 		if isNumericType(dataType) {
 			return compareNumericStrings(a, b, "eq")
@@ -274,7 +292,7 @@ func comparePostgreSQLValues(a, b, operator string, dataType uint32) bool {
 		}
 		// Default string comparison
 		return a == b
-	case "ne":
+	case OpNotEqual:
 		// Inverse of eq logic
 		if isNumericType(dataType) {
 			return !compareNumericStrings(a, b, "eq")
@@ -283,7 +301,7 @@ func comparePostgreSQLValues(a, b, operator string, dataType uint32) bool {
 			return !compareTimeStrings(a, b, "eq")
 		}
 		return a != b
-	case "gt", "lt", "gte", "lte":
+	case OpGreaterThan, OpLessThan, OpGreaterThanOrEqual, OpLessThanOrEqual:
 		// For numeric types, do numeric comparison
 		if isNumericType(dataType) {
 			return compareNumericStrings(a, b, operator)
@@ -359,9 +377,9 @@ func compareBooleanStrings(a, b, operator string) bool {
 	bBool := postgresStringToBool(b)
 
 	switch operator {
-	case "eq":
+	case OpEqual:
 		return aBool == bBool
-	case "ne":
+	case OpNotEqual:
 		return aBool != bBool
 	default:
 		return false // Boolean values don't have ordering
@@ -392,15 +410,15 @@ func compareNumericStrings(a, b, operator string) bool {
 	}
 
 	switch operator {
-	case "eq":
+	case OpEqual:
 		return aFloat == bFloat
-	case "gt":
+	case OpGreaterThan:
 		return aFloat > bFloat
-	case "lt":
+	case OpLessThan:
 		return aFloat < bFloat
-	case "gte":
+	case OpGreaterThanOrEqual:
 		return aFloat >= bFloat
-	case "lte":
+	case OpLessThanOrEqual:
 		return aFloat <= bFloat
 	}
 	return false
@@ -412,15 +430,15 @@ func compareTimeStrings(a, b, operator string) bool {
 
 	if aErr == nil && bErr == nil {
 		switch operator {
-		case "eq":
+		case OpEqual:
 			return aTime.Equal(bTime)
-		case "gt":
+		case OpGreaterThan:
 			return aTime.After(bTime)
-		case "lt":
+		case OpLessThan:
 			return aTime.Before(bTime)
-		case "gte":
+		case OpGreaterThanOrEqual:
 			return aTime.After(bTime) || aTime.Equal(bTime)
-		case "lte":
+		case OpLessThanOrEqual:
 			return aTime.Before(bTime) || aTime.Equal(bTime)
 		}
 	}
@@ -440,13 +458,13 @@ func parseBasicTime(s string) (time.Time, error) {
 
 func compareLexicographic(a, b, operator string) bool {
 	switch operator {
-	case "gt":
+	case OpGreaterThan:
 		return a > b
-	case "lt":
+	case OpLessThan:
 		return a < b
-	case "gte":
+	case OpGreaterThanOrEqual:
 		return a >= b
-	case "lte":
+	case OpLessThanOrEqual:
 		return a <= b
 	}
 	return false
@@ -456,7 +474,7 @@ func shouldApplyRule(operations []utils.OperationType, allowEmptyDeletes bool, m
 	if !containsOperation(operations, messageType) {
 		return false
 	}
-	return !(messageType == utils.OperationDelete && allowEmptyDeletes)
+	return messageType != utils.OperationDelete || !allowEmptyDeletes
 }
 
 // Apply applies the transform rule to the provided data

@@ -1,3 +1,4 @@
+// Package worker provides message processing workers for pg_flo.
 package worker
 
 import (

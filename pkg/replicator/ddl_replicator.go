@@ -12,6 +12,7 @@ import (
 	"github.com/pgflo/pg_flo/pkg/utils"
 )
 
+// DDLReplicator handles Data Definition Language (DDL) statement replication
 type DDLReplicator struct {
 	DDLConn  StandardConnection
 	BaseRepl *BaseReplicator

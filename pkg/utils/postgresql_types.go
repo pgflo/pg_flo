@@ -1,4 +1,4 @@
-package utils
+package utils //nolint:revive // utils is a standard package name
 
 import (
 	"fmt"
@@ -123,5 +123,5 @@ func (c *PostgreSQLTypeConverter) EncodePostgreSQLValue(value interface{}, dataT
 	return encoded, nil
 }
 
-// Global instance for easy access
+// GlobalPostgreSQLTypeConverter is a global instance for easy access
 var GlobalPostgreSQLTypeConverter = NewPostgreSQLTypeConverter()

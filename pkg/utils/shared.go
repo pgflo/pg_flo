@@ -1,4 +1,4 @@
-package utils
+package utils //nolint:revive // utils is a standard package name
 
 import (
 	"fmt"
@@ -95,7 +95,11 @@ func ToInt64(v interface{}) (int64, bool) {
 	case int, int8, int16, int32, int64:
 		return reflect.ValueOf(v).Int(), true
 	case uint, uint8, uint16, uint32, uint64:
-		return int64(reflect.ValueOf(v).Uint()), true
+		val := reflect.ValueOf(v).Uint()
+		if val > 9223372036854775807 { // max int64
+			return 0, false // value too large for int64
+		}
+		return int64(val), true
 	case string:
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return i, true

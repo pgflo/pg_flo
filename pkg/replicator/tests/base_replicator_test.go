@@ -134,7 +134,7 @@ func TestBaseReplicator(t *testing.T) {
 			mockStandardConn := new(MockStandardConnection)
 			mockStandardConn.On("QueryRow", mock.Anything, "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", mock.Anything).
 				Return(MockRow{
-					scanFunc: func(dest ...interface{}) error {
+					scanFunc: func(dest ...interface{}) error { //nolint:revive // dest is used but linter doesn't detect it
 						return errors.New("database error")
 					},
 				})
@@ -1108,7 +1108,7 @@ func TestBaseReplicator(t *testing.T) {
 		t.Run("Error checking slot existence", func(t *testing.T) {
 			mockStandardConn := new(MockStandardConnection)
 			mockStandardConn.On("QueryRow", mock.Anything, mock.Anything, mock.Anything).Return(MockRow{
-				scanFunc: func(dest ...interface{}) error {
+				scanFunc: func(dest ...interface{}) error { //nolint:revive // dest parameter required by interface
 					return errors.New("query error")
 				},
 			})

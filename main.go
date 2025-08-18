@@ -1,3 +1,4 @@
+// Package main provides the entry point for the pg_flo PostgreSQL replication tool.
 package main
 
 import (

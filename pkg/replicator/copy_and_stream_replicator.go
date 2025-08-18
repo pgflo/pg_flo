@@ -19,6 +19,7 @@ type CopyAndStreamReplicator struct {
 	CopyOnly               bool
 }
 
+// NewCopyAndStreamReplicator creates a new copy and stream replicator instance
 func NewCopyAndStreamReplicator(base *BaseReplicator, maxWorkers int, copyOnly bool) *CopyAndStreamReplicator {
 	return &CopyAndStreamReplicator{
 		BaseReplicator:         base,
@@ -27,7 +28,7 @@ func NewCopyAndStreamReplicator(base *BaseReplicator, maxWorkers int, copyOnly b
 	}
 }
 
-// StartReplication begins the replication process.
+// Start begins the replication process.
 func (r *CopyAndStreamReplicator) Start(ctx context.Context) error {
 	if err := r.BaseReplicator.Start(ctx); err != nil {
 		return err
@@ -45,6 +46,7 @@ func (r *CopyAndStreamReplicator) Start(ctx context.Context) error {
 	return r.StartReplicationFromLSN(ctx, r.LastLSN, r.stopChan)
 }
 
+// Stop stops the copy and stream replicator
 func (r *CopyAndStreamReplicator) Stop(ctx context.Context) error {
 	return r.BaseReplicator.Stop(ctx)
 }
@@ -63,7 +65,7 @@ func (r *CopyAndStreamReplicator) ParallelCopy(ctx context.Context) error {
 
 	r.Logger.Info().Str("snapshotID", snapshotID).Str("startLSN", startLSN.String()).Msg("Starting parallel copy")
 
-	r.BaseReplicator.LastLSN = startLSN
+	r.LastLSN = startLSN
 
 	if err := r.CopyTables(ctx, r.Config.Tables, snapshotID); err != nil {
 		return err
@@ -74,7 +76,7 @@ func (r *CopyAndStreamReplicator) ParallelCopy(ctx context.Context) error {
 
 // startSnapshotTransaction starts a new transaction with serializable isolation level.
 func (r *CopyAndStreamReplicator) startSnapshotTransaction(ctx context.Context) (pgx.Tx, error) {
-	return r.BaseReplicator.StandardConn.BeginTx(ctx, pgx.TxOptions{
+	return r.StandardConn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.Serializable,
 		AccessMode: pgx.ReadOnly,
 	})
@@ -195,7 +197,7 @@ func (r *CopyAndStreamReplicator) CopyTableWorker(ctx context.Context, wg *sync.
 
 // CopyTableRange copies a range of pages from a table.
 func (r *CopyAndStreamReplicator) CopyTableRange(ctx context.Context, tableName string, startPage, endPage uint32, snapshotID string, workerID int) (int64, error) {
-	conn, err := r.BaseReplicator.StandardConn.Acquire(ctx)
+	conn, err := r.StandardConn.Acquire(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to acquire connection: %v", err)
 	}
@@ -288,8 +290,8 @@ func (r *CopyAndStreamReplicator) executeCopyQuery(ctx context.Context, tx pgx.T
 			EmittedAt: time.Now(),
 		}
 
-		r.BaseReplicator.AddPrimaryKeyInfo(&cdcMessage, tableName)
-		if err := r.BaseReplicator.PublishToNATS(cdcMessage); err != nil {
+		r.AddPrimaryKeyInfo(&cdcMessage, tableName)
+		if err := r.PublishToNATS(cdcMessage); err != nil {
 			return 0, fmt.Errorf("failed to publish insert event to NATS: %v", err)
 		}
 

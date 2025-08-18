@@ -43,6 +43,7 @@ type FilterRule struct {
 	AllowEmptyDeletes bool
 }
 
+// ExcludeColumnRule removes specified columns from CDC messages
 type ExcludeColumnRule struct {
 	TableName  string
 	ColumnName string

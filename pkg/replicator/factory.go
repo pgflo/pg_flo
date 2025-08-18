@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// ReplicatorFactory defines the interface for creating replicators
+// Factory defines the interface for creating replicators
 type Factory interface {
 	CreateReplicator(config Config, natsClient NATSClient) (Replicator, error)
 }

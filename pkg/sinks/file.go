@@ -1,3 +1,4 @@
+// Package sinks provides various output destinations for processed CDC messages.
 package sinks
 
 import (
@@ -40,7 +41,7 @@ func NewFileSink(outputDir string) (*FileSink, error) {
 		rotateInterval: time.Hour,         // Rotate every hour if size limit not reached
 	}
 
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %v", err)
 	}
 
@@ -65,7 +66,7 @@ func (s *FileSink) rotateFile() error {
 	filename := fmt.Sprintf("pg_flo_log_%s.jsonl", timestamp)
 	filepath := filepath.Join(s.outputDir, filename)
 
-	file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304 - controlled file path
 	if err != nil {
 		return fmt.Errorf("failed to create new log file: %v", err)
 	}

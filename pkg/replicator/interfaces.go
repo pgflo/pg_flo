@@ -11,11 +11,13 @@ import (
 	"github.com/pgflo/pg_flo/pkg/pgflonats"
 )
 
+// Replicator defines the interface for PostgreSQL replicators
 type Replicator interface {
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
 }
 
+// ReplicationConnection defines the interface for PostgreSQL logical replication connections
 type ReplicationConnection interface {
 	Connect(ctx context.Context) error
 	Close(ctx context.Context) error
@@ -25,6 +27,7 @@ type ReplicationConnection interface {
 	SendStandbyStatusUpdate(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error
 }
 
+// StandardConnection defines the interface for standard PostgreSQL connections
 type StandardConnection interface {
 	Connect(ctx context.Context) error
 	Close(ctx context.Context) error
@@ -35,6 +38,7 @@ type StandardConnection interface {
 	Acquire(ctx context.Context) (PgxPoolConn, error)
 }
 
+// PgxPoolConn defines the interface for PostgreSQL connection pool connections
 type PgxPoolConn interface {
 	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
 	Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error)
@@ -43,6 +47,7 @@ type PgxPoolConn interface {
 	Release()
 }
 
+// NATSClient defines the interface for NATS messaging operations
 type NATSClient interface {
 	PublishMessage(subject string, data []byte) error
 	Close() error

@@ -1,3 +1,4 @@
+// Package rules provides filtering and transformation rules for CDC messages.
 package rules
 
 import (
