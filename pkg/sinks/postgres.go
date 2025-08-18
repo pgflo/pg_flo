@@ -120,7 +120,6 @@ func (s *PostgresSink) handleInsert(tx pgx.Tx, message *utils.CDCMessage) error 
 			return fmt.Errorf("failed to get column value: %w", err)
 		}
 
-		// Skip NULL values - let PostgreSQL use column defaults
 		if value == nil {
 			continue
 		}
@@ -160,11 +159,10 @@ func getWhereConditions(message *utils.CDCMessage, useOldValues bool, startingIn
 
 	switch message.ReplicationKey.Type {
 	case utils.ReplicationKeyFull:
-		// For FULL, use all non-null values
 		for _, col := range message.Columns {
 			value, err := message.GetColumnValue(col.Name, useOldValues)
 			if err != nil {
-				continue // Skip columns with errors
+				continue
 			}
 			if value == nil {
 				conditions = append(conditions, fmt.Sprintf("%s IS NULL", col.Name))
@@ -175,7 +173,6 @@ func getWhereConditions(message *utils.CDCMessage, useOldValues bool, startingIn
 			}
 		}
 	case utils.ReplicationKeyPK, utils.ReplicationKeyUnique:
-		// For PK/UNIQUE, use only the key columns
 		for _, colName := range message.ReplicationKey.Columns {
 			value, err := message.GetColumnValue(colName, useOldValues)
 			if err != nil {
@@ -243,12 +240,10 @@ func (s *PostgresSink) handleUpdate(tx pgx.Tx, message *utils.CDCMessage) error 
 	valueIndex := 1
 
 	for _, column := range message.Columns {
-		// Skip toasted columns
 		if message.IsColumnToasted(column.Name) {
 			continue
 		}
 
-		// Get the new value for the column
 		value, err := message.GetColumnValue(column.Name, false)
 		if err != nil {
 			return fmt.Errorf("failed to get column value: %w", err)
