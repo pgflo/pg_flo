@@ -336,10 +336,10 @@ func TestNumericFilters(t *testing.T) {
 			name: "Equal Numeric Filter (Exact Match) - Pass",
 			rule: createRule(t, "filter", "products", "weight", map[string]interface{}{
 				"operator": "eq",
-				"value":    "1.23",
+				"value":    "1.24",
 			}),
-			input:          createCDCMessage(utils.OperationInsert, "weight", pgtype.NumericOID, "1.23"),
-			expectedOutput: createCDCMessage(utils.OperationInsert, "weight", pgtype.NumericOID, "1.23"),
+			input:          createCDCMessage(utils.OperationInsert, "weight", pgtype.NumericOID, "1.24"),
+			expectedOutput: createCDCMessage(utils.OperationInsert, "weight", pgtype.NumericOID, "1.24"),
 		},
 	}
 
