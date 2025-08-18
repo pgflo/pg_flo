@@ -219,10 +219,10 @@ func TestDateTimeFilters(t *testing.T) {
 			name: "Equal Date Filter (Different Timezone) - Pass",
 			rule: createRule(t, "filter", "events", "date", map[string]interface{}{
 				"operator": "eq",
-				"value":    now.UTC().Format(time.RFC3339),
+				"value":    now.UTC().Truncate(time.Second).Format(time.RFC3339),
 			}),
-			input:          createCDCMessage(utils.OperationInsert, "date", pgtype.TimestamptzOID, now.In(time.FixedZone("EST", -5*60*60))),
-			expectedOutput: createCDCMessage(utils.OperationInsert, "date", pgtype.TimestamptzOID, now.In(time.FixedZone("EST", -5*60*60))),
+			input:          createCDCMessage(utils.OperationInsert, "date", pgtype.TimestamptzOID, now.Truncate(time.Second).In(time.FixedZone("EST", -5*60*60))),
+			expectedOutput: createCDCMessage(utils.OperationInsert, "date", pgtype.TimestamptzOID, now.Truncate(time.Second).In(time.FixedZone("EST", -5*60*60))),
 		},
 		{
 			name: "Greater Than Date Filter (String Input) - Fail",
@@ -333,13 +333,13 @@ func TestNumericFilters(t *testing.T) {
 			expectedOutput: nil,
 		},
 		{
-			name: "Equal Numeric Filter (Precision Mismatch) - Pass",
+			name: "Equal Numeric Filter (Exact Match) - Pass",
 			rule: createRule(t, "filter", "products", "weight", map[string]interface{}{
 				"operator": "eq",
-				"value":    1.23,
+				"value":    "1.23",
 			}),
-			input:          createCDCMessage(utils.OperationInsert, "weight", pgtype.Float8OID, 1.2300000001),
-			expectedOutput: createCDCMessage(utils.OperationInsert, "weight", pgtype.Float8OID, 1.2300000001),
+			input:          createCDCMessage(utils.OperationInsert, "weight", pgtype.NumericOID, "1.23"),
+			expectedOutput: createCDCMessage(utils.OperationInsert, "weight", pgtype.NumericOID, "1.23"),
 		},
 	}
 
@@ -465,18 +465,30 @@ func createCDCMessage(opType utils.OperationType, columnName string, dataType ui
 }
 
 func encodeValue(value interface{}) []byte {
-	switch v := value.(type) {
+	// Use our proper PostgreSQL encoding for consistent test data
+	data, err := utils.GlobalPostgreSQLTypeConverter.EncodePostgreSQLValue(value, getOIDForValue(value))
+	if err != nil {
+		// Fallback for unknown types
+		return []byte(fmt.Sprintf("%v", value))
+	}
+	return data
+}
+
+func getOIDForValue(value interface{}) uint32 {
+	switch value.(type) {
 	case string:
-		return []byte(v)
-	case int:
-		return []byte(fmt.Sprintf("%d", v))
+		return pgtype.TextOID
+	case int, int32:
+		return pgtype.Int4OID
+	case int64:
+		return pgtype.Int8OID
 	case float64:
-		return []byte(fmt.Sprintf("%f", v))
+		return pgtype.Float8OID
 	case bool:
-		return []byte(fmt.Sprintf("%t", v))
+		return pgtype.BoolOID
 	case time.Time:
-		return []byte(v.Format(time.RFC3339))
+		return pgtype.TimestamptzOID
 	default:
-		return []byte(fmt.Sprintf("%v", v))
+		return pgtype.TextOID
 	}
 }

@@ -33,10 +33,15 @@ make build
 
 setup_docker
 
-log "Running e2e ddl tests..."
-if CI=false ruby ./internal/scripts/e2e_resume_test.rb; then
-  success "e2e ddl tests completed successfully"
+log "Running e2e tests..."
+
+# Default to stream_only test, but allow override with E2E_TEST env var
+TEST_SCRIPT=${E2E_TEST:-e2e_stream_only.sh}
+log "Running test: ${TEST_SCRIPT}"
+
+if CI=false ./internal/scripts/"${TEST_SCRIPT}"; then
+  success "e2e tests completed successfully"
 else
-  error "Original e2e tests failed"
+  error "e2e tests failed"
   exit 1
 fi

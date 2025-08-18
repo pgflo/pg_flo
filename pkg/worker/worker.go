@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"os"
@@ -175,7 +177,9 @@ func (w *Worker) processMessage(msg *nats.Msg) error {
 	}
 
 	var cdcMessage utils.CDCMessage
-	err = cdcMessage.UnmarshalBinary(msg.Data)
+	buf := bytes.NewBuffer(msg.Data)
+	dec := gob.NewDecoder(buf)
+	err = dec.Decode(&cdcMessage)
 	if err != nil {
 		w.logger.Error().Err(err).Msg("Failed to unmarshal message")
 		return err

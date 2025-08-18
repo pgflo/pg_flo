@@ -13,6 +13,8 @@ import (
 func ParseTimestamp(value string) (time.Time, error) {
 	layouts := []string{
 		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999-07:00",     // Our encoding format
+		"2006-01-02 15:04:05.999999 -0700 MST", // pgx format
 		"2006-01-02 15:04:05.999999-07",
 		"2006-01-02 15:04:05.999999Z07:00",
 		"2006-01-02 15:04:05.999999",

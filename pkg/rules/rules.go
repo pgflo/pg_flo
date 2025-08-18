@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pgflo/pg_flo/pkg/utils"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
@@ -198,72 +198,8 @@ func NewComparisonCondition(column, operator string, value interface{}) func(*ut
 			return false
 		}
 
-		columnType := m.Columns[colIndex].DataType
-
-		switch columnType {
-		case pgtype.Int2OID, pgtype.Int4OID, pgtype.Int8OID:
-			intVal, ok := utils.ToInt64(columnValue)
-			if !ok {
-				return false
-			}
-			compareVal, ok := utils.ToInt64(value)
-			if !ok {
-				return false
-			}
-			return compareValues(intVal, compareVal, operator)
-		case pgtype.Float4OID, pgtype.Float8OID:
-			floatVal, ok := utils.ToFloat64(columnValue)
-			if !ok {
-				return false
-			}
-			compareVal, ok := utils.ToFloat64(value)
-			if !ok {
-				return false
-			}
-			return compareValues(floatVal, compareVal, operator)
-		case pgtype.TextOID, pgtype.VarcharOID:
-			strVal, ok := columnValue.(string)
-			if !ok {
-				return false
-			}
-			compareVal, ok := value.(string)
-			if !ok {
-				return false
-			}
-			return compareValues(strVal, compareVal, operator)
-		case pgtype.TimestampOID, pgtype.TimestamptzOID:
-			timeVal, ok := columnValue.(time.Time)
-			if !ok {
-				return false
-			}
-			compareVal, err := utils.ParseTimestamp(fmt.Sprintf("%v", value))
-			if err != nil {
-				return false
-			}
-			return compareValues(timeVal.UTC(), compareVal.UTC(), operator)
-		case pgtype.BoolOID:
-			boolVal, ok := utils.ToBool(columnValue)
-			if !ok {
-				return false
-			}
-			compareVal, ok := value.(bool)
-			if !ok {
-				return false
-			}
-			return compareValues(boolVal, compareVal, operator)
-		case pgtype.NumericOID:
-			numVal, ok := columnValue.(string)
-			if !ok {
-				return false
-			}
-			compareVal, ok := value.(string)
-			if !ok {
-				return false
-			}
-			return compareNumericValues(numVal, compareVal, operator)
-		default:
-			return false
-		}
+		// Unified comparison - work directly with pgx native types
+		return compareAnyValues(columnValue, value, operator)
 	}
 }
 
@@ -287,78 +223,349 @@ func NewContainsCondition(column string, value interface{}) func(*utils.CDCMessa
 	}
 }
 
-// compareValues compares two values based on the provided operator
-func compareValues(a, b interface{}, operator string) bool {
+// compareAnyValues is a unified comparison function that works with any type
+func compareAnyValues(a, b interface{}, operator string) bool {
+	// Handle nil values
+	if a == nil || b == nil {
+		switch operator {
+		case "eq":
+			return a == nil && b == nil
+		case "ne":
+			return !(a == nil && b == nil)
+		default:
+			return false
+		}
+	}
+
+	// Handle time.Time with timezone awareness
+	if aTime, ok := a.(time.Time); ok {
+		if bTime, ok := b.(time.Time); ok {
+			return compareTime(aTime, bTime, operator)
+		}
+		// Try to parse string as time
+		if bStr := fmt.Sprintf("%v", b); bStr != "" {
+			if bTime, err := utils.ParseTimestamp(bStr); err == nil {
+				return compareTime(aTime, bTime, operator)
+			}
+		}
+		return false
+	}
+
+	// Handle pgtype.Numeric with precision
+	if aNum, ok := a.(pgtype.Numeric); ok {
+		if !aNum.Valid {
+			return false
+		}
+		aDec := decimal.NewFromBigInt(aNum.Int, aNum.Exp)
+		bDec, err := decimal.NewFromString(fmt.Sprintf("%v", b))
+		if err != nil {
+			return false
+		}
+		return compareDecimalValues(aDec, bDec, operator)
+	}
+
+	// Handle numeric mixing (int vs float) - ONLY if both are actually numeric
+	if isNumeric(a) && isNumeric(b) {
+		aFloat, aOk := convertToFloat64(a)
+		bFloat, bOk := convertToFloat64(b)
+		if aOk && bOk {
+			return compareFloat64(aFloat, bFloat, operator)
+		}
+	}
+
+	// Try to convert rule value (b) to match column type (a) for user-friendly rules
+	if convertedB, ok := tryConvertRuleValue(b, a); ok {
+		// Use the converted value for comparison
+		switch operator {
+		case "eq":
+			return reflect.DeepEqual(a, convertedB)
+		case "ne":
+			return !reflect.DeepEqual(a, convertedB)
+		default:
+			// For ordering, ensure both are the same type now
+			return compareConvertedValues(a, convertedB, operator)
+		}
+	}
+
+	// If conversion failed, check strict type compatibility
+	aType := reflect.TypeOf(a)
+	bType := reflect.TypeOf(b)
+	if !areTypesCompatible(aType, bType) {
+		return false // Incompatible types fail comparison
+	}
+
+	// Direct comparison for compatible types
 	switch operator {
 	case "eq":
 		return reflect.DeepEqual(a, b)
 	case "ne":
 		return !reflect.DeepEqual(a, b)
-	case "gt":
-		return compareGreaterThan(a, b)
-	case "lt":
-		return compareLessThan(a, b)
-	case "gte":
-		return compareGreaterThan(a, b) || reflect.DeepEqual(a, b)
-	case "lte":
-		return compareLessThan(a, b) || reflect.DeepEqual(a, b)
+	default:
+		// For ordering on compatible types, use string comparison as fallback
+		aStr := fmt.Sprintf("%v", a)
+		bStr := fmt.Sprintf("%v", b)
+		return compareStringValues(aStr, bStr, operator)
 	}
+}
+
+// Helper functions for unified comparison system
+
+// tryConvertRuleValue attempts to convert rule value to match column type
+func tryConvertRuleValue(ruleValue, columnValue interface{}) (interface{}, bool) {
+	ruleStr := fmt.Sprintf("%v", ruleValue)
+
+	switch columnValue.(type) {
+	case int32:
+		if val, ok := utils.ToInt64(ruleValue); ok {
+			return int32(val), true
+		}
+		if val, ok := utils.ToInt64(ruleStr); ok {
+			return int32(val), true
+		}
+	case int64:
+		if val, ok := utils.ToInt64(ruleValue); ok {
+			return val, true
+		}
+		if val, ok := utils.ToInt64(ruleStr); ok {
+			return val, true
+		}
+	case float64:
+		if val, ok := utils.ToFloat64(ruleValue); ok {
+			return val, true
+		}
+		if val, ok := utils.ToFloat64(ruleStr); ok {
+			return val, true
+		}
+	case bool:
+		if val, ok := utils.ToBool(ruleValue); ok {
+			return val, true
+		}
+		if val, ok := utils.ToBool(ruleStr); ok {
+			return val, true
+		}
+	}
+
+	return nil, false
+}
+
+// compareConvertedValues compares values of the same type
+func compareConvertedValues(a, b interface{}, operator string) bool {
+	switch aVal := a.(type) {
+	case int32:
+		bVal := b.(int32)
+		return compareInt32(aVal, bVal, operator)
+	case int64:
+		bVal := b.(int64)
+		return compareInt64(aVal, bVal, operator)
+	case float64:
+		bVal := b.(float64)
+		return compareFloat64(aVal, bVal, operator)
+	case bool:
+		bVal := b.(bool)
+		return compareBool(aVal, bVal, operator)
+	default:
+		return false
+	}
+}
+
+// areTypesCompatible checks if two types can be meaningfully compared
+func areTypesCompatible(aType, bType reflect.Type) bool {
+	if aType == bType {
+		return true // Same types are always compatible
+	}
+
+	// Allow numeric type mixing (int, float)
+	if isNumericType(aType) && isNumericType(bType) {
+		return true
+	}
+
+	// Allow string comparisons with string-like types
+	if isStringType(aType) && isStringType(bType) {
+		return true
+	}
+
+	// All other combinations are incompatible
 	return false
 }
 
-// compareGreaterThan checks if 'a' is greater than 'b'
-func compareGreaterThan(a, b interface{}) bool {
-	switch a := a.(type) {
-	case int64:
-		return a > b.(int64)
-	case float64:
-		return a > b.(float64)
-	case string:
-		return a > b.(string)
-	case time.Time:
-		return a.After(b.(time.Time))
+// isNumericType checks if a reflect.Type represents a numeric type
+func isNumericType(t reflect.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
 	default:
 		return false
 	}
 }
 
-// compareLessThan checks if 'a' is less than 'b'
-func compareLessThan(a, b interface{}) bool {
-	switch a := a.(type) {
-	case int64:
-		return a < b.(int64)
-	case float64:
-		return a < b.(float64)
-	case string:
-		return a < b.(string)
-	case time.Time:
-		return a.Before(b.(time.Time))
+// isStringType checks if a reflect.Type represents a string-like type
+func isStringType(t reflect.Type) bool {
+	if t == nil {
+		return false
+	}
+	return t.Kind() == reflect.String
+}
+
+// isNumeric checks if a value is a numeric type
+func isNumeric(v interface{}) bool {
+	switch v.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return true
 	default:
 		return false
 	}
 }
 
-// compareNumericValues compares two numeric values based on the provided operator
-func compareNumericValues(a, b string, operator string) bool {
-	aNum, err1 := decimal.NewFromString(a)
-	bNum, err2 := decimal.NewFromString(b)
-	if err1 != nil || err2 != nil {
-		return false
+// convertToFloat64 safely converts various numeric types to float64
+func convertToFloat64(v interface{}) (float64, bool) {
+	switch val := v.(type) {
+	case int:
+		return float64(val), true
+	case int32:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case float32:
+		return float64(val), true
+	case float64:
+		return val, true
+	default:
+		return 0, false
 	}
+}
 
+// compareFloat64 compares two float64 values
+func compareFloat64(a, b float64, operator string) bool {
 	switch operator {
 	case "eq":
-		return aNum.Equal(bNum)
+		return a == b
 	case "ne":
-		return !aNum.Equal(bNum)
+		return a != b
 	case "gt":
-		return aNum.GreaterThan(bNum)
+		return a > b
 	case "lt":
-		return aNum.LessThan(bNum)
+		return a < b
 	case "gte":
-		return aNum.GreaterThanOrEqual(bNum)
+		return a >= b
 	case "lte":
-		return aNum.LessThanOrEqual(bNum)
+		return a <= b
+	default:
+		return false
+	}
+}
+
+// compareTime compares two time.Time values
+func compareTime(a, b time.Time, operator string) bool {
+	switch operator {
+	case "eq":
+		return a.Equal(b)
+	case "ne":
+		return !a.Equal(b)
+	case "gt":
+		return a.After(b)
+	case "lt":
+		return a.Before(b)
+	case "gte":
+		return a.After(b) || a.Equal(b)
+	case "lte":
+		return a.Before(b) || a.Equal(b)
+	default:
+		return false
+	}
+}
+
+// compareInt32 compares two int32 values
+func compareInt32(a, b int32, operator string) bool {
+	switch operator {
+	case "eq":
+		return a == b
+	case "ne":
+		return a != b
+	case "gt":
+		return a > b
+	case "lt":
+		return a < b
+	case "gte":
+		return a >= b
+	case "lte":
+		return a <= b
+	default:
+		return false
+	}
+}
+
+// compareInt64 compares two int64 values
+func compareInt64(a, b int64, operator string) bool {
+	switch operator {
+	case "eq":
+		return a == b
+	case "ne":
+		return a != b
+	case "gt":
+		return a > b
+	case "lt":
+		return a < b
+	case "gte":
+		return a >= b
+	case "lte":
+		return a <= b
+	default:
+		return false
+	}
+}
+
+// compareBool compares two boolean values
+func compareBool(a, b bool, operator string) bool {
+	switch operator {
+	case "eq":
+		return a == b
+	case "ne":
+		return a != b
+	default:
+		return false // Boolean values don't have ordering
+	}
+}
+
+// compareStringValues compares two string values
+func compareStringValues(a, b string, operator string) bool {
+	switch operator {
+	case "eq":
+		return a == b
+	case "ne":
+		return a != b
+	case "gt":
+		return a > b
+	case "lt":
+		return a < b
+	case "gte":
+		return a >= b
+	case "lte":
+		return a <= b
+	default:
+		return false
+	}
+}
+
+// compareDecimalValues compares two decimal values directly - no string conversion
+func compareDecimalValues(a, b decimal.Decimal, operator string) bool {
+	switch operator {
+	case "eq":
+		return a.Equal(b)
+	case "ne":
+		return !a.Equal(b)
+	case "gt":
+		return a.GreaterThan(b)
+	case "lt":
+		return a.LessThan(b)
+	case "gte":
+		return a.GreaterThanOrEqual(b)
+	case "lte":
+		return a.LessThanOrEqual(b)
 	default:
 		return false
 	}

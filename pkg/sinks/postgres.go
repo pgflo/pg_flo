@@ -113,14 +113,22 @@ func (s *PostgresSink) handleInsert(tx pgx.Tx, message *utils.CDCMessage) error 
 	placeholders := make([]string, 0, len(message.Columns))
 	values := make([]interface{}, 0, len(message.Columns))
 
-	for i, col := range message.Columns {
+	paramIndex := 1
+	for _, col := range message.Columns {
 		value, err := message.GetColumnValue(col.Name, false)
 		if err != nil {
 			return fmt.Errorf("failed to get column value: %w", err)
 		}
+
+		// Skip NULL values - let PostgreSQL use column defaults
+		if value == nil {
+			continue
+		}
+
 		columns = append(columns, col.Name)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+		placeholders = append(placeholders, fmt.Sprintf("$%d", paramIndex))
 		values = append(values, value)
+		paramIndex++
 	}
 
 	query := fmt.Sprintf(

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
-	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v5"
 	"github.com/pgflo/pg_flo/pkg/utils"
 )
@@ -278,41 +277,14 @@ func (r *CopyAndStreamReplicator) executeCopyQuery(ctx context.Context, tx pgx.T
 
 	var copyCount int64
 	for rows.Next() {
-		values, err := rows.Values()
-		if err != nil {
-			return 0, fmt.Errorf("error reading row: %v", err)
-		}
-
-		tupleData := &pglogrepl.TupleData{
-			Columns: make([]*pglogrepl.TupleDataColumn, len(values)),
-		}
-		for i, value := range values {
-			data, err := utils.ConvertToPgCompatibleOutput(value, fieldDescriptions[i].DataTypeOID)
-			if err != nil {
-				return 0, fmt.Errorf("error converting value: %v", err)
-			}
-			tupleType := pglogrepl.TupleDataTypeBinary
-			if value == nil {
-				tupleType = pglogrepl.TupleDataTypeNull
-			} else {
-				switch fieldDescriptions[i].DataTypeOID {
-				case pgtype.TextOID, pgtype.VarcharOID, pgtype.QCharOID, pgtype.ByteaOID:
-					tupleType = pglogrepl.TupleDataTypeText
-				}
-			}
-
-			tupleData.Columns[i] = &pglogrepl.TupleDataColumn{
-				DataType: tupleType,
-				Data:     data,
-			}
-		}
+		rawData := rows.RawValues()
 
 		cdcMessage := utils.CDCMessage{
 			Type:      utils.OperationInsert,
 			Schema:    schema,
 			Table:     tableName,
 			Columns:   columns,
-			NewTuple:  tupleData,
+			CopyData:  rawData,
 			EmittedAt: time.Now(),
 		}
 
