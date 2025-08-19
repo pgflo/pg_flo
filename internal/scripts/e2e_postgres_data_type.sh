@@ -4,7 +4,7 @@ set -euo pipefail
 source "$(dirname "$0")/e2e_common.sh"
 
 create_test_table() {
-  log "Creating test table with various data types including comprehensive array testing..."
+  log "Creating test table with various data types including   array testing..."
 
   # Create required extensions
   run_sql "CREATE EXTENSION IF NOT EXISTS hstore;"

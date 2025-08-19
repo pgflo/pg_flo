@@ -21,6 +21,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// Constants for configuration values
+const (
+	defaultBatchSize     = 1000
+	defaultFlushInterval = 500 * time.Millisecond
+)
+
 // Worker represents a worker that processes messages from NATS.
 type Worker struct {
 	natsClient     *pgflonats.NATSClient
@@ -33,7 +39,6 @@ type Worker struct {
 	buffer         []*utils.CDCMessage
 	lastSavedState uint64
 	flushInterval  time.Duration
-	shutdownCh     chan struct{}
 	wg             sync.WaitGroup
 }
 
@@ -63,11 +68,9 @@ func NewWorker(natsClient *pgflonats.NATSClient, ruleEngine *rules.RuleEngine, r
 		sink:           sink,
 		group:          group,
 		logger:         logger,
-		batchSize:      1000,
-		buffer:         make([]*utils.CDCMessage, 0, 1000),
+		batchSize:      defaultBatchSize,
 		lastSavedState: 0,
-		flushInterval:  500 * time.Millisecond,
-		shutdownCh:     make(chan struct{}),
+		flushInterval:  defaultFlushInterval,
 	}
 
 	for _, opt := range opts {
@@ -128,7 +131,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.wg.Wait()
 	w.logger.Debug().Msg("All goroutines finished")
 
-	return w.flushBuffer()
+	// Perform final cleanup
+	return w.gracefulShutdown(sub)
 }
 
 // processMessages continuously processes messages from the NATS consumer.
@@ -160,6 +164,7 @@ func (w *Worker) processMessages(ctx context.Context, sub *nats.Subscription) er
 					w.logger.Error().Err(err).Msg("Failed to acknowledge message")
 				}
 			}
+
 			if len(w.buffer) >= w.batchSize {
 				if err := w.flushBuffer(); err != nil {
 					w.logger.Error().Err(err).Msg("Failed to flush buffer")
@@ -249,4 +254,53 @@ func (w *Worker) flushBuffer() error {
 
 	w.buffer = w.buffer[:0]
 	return nil
+}
+
+// gracefulShutdown performs   resource cleanup during worker shutdown
+func (w *Worker) gracefulShutdown(sub *nats.Subscription) error {
+	w.logger.Info().Msg("Performing graceful shutdown cleanup")
+
+	var shutdownErrors []error
+
+	if err := w.flushBuffer(); err != nil {
+		w.logger.Error().Err(err).Msg("Failed to flush final buffer")
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to flush buffer: %w", err))
+	}
+
+	if sub != nil {
+		if err := sub.Unsubscribe(); err != nil {
+			w.logger.Error().Err(err).Msg("Failed to unsubscribe from NATS")
+			shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to unsubscribe: %w", err))
+		} else {
+			w.logger.Debug().Msg("Successfully unsubscribed from NATS")
+		}
+	}
+
+	if w.sink != nil {
+		if closer, ok := w.sink.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				w.logger.Error().Err(err).Msg("Failed to close sink")
+				shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to close sink: %w", err))
+			} else {
+				w.logger.Debug().Msg("Successfully closed sink")
+			}
+		}
+	}
+
+	if w.natsClient != nil {
+		if err := w.natsClient.Close(); err != nil {
+			w.logger.Error().Err(err).Msg("Failed to close NATS client")
+			shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to close NATS client: %w", err))
+		} else {
+			w.logger.Debug().Msg("Successfully closed NATS client")
+		}
+	}
+
+	if len(shutdownErrors) == 0 {
+		w.logger.Info().Msg("Graceful shutdown completed successfully")
+		return nil
+	}
+
+	w.logger.Error().Int("errors", len(shutdownErrors)).Msg("Shutdown completed with errors")
+	return shutdownErrors[0]
 }
