@@ -49,13 +49,21 @@ func NewNATSClient(url, stream, group string) (*NATSClient, error) {
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(time.Second),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			fmt.Printf("Disconnected due to: %s, will attempt reconnects\n", err)
+			if err != nil {
+				fmt.Printf("Disconnected due to: %v, will attempt reconnects\n", err)
+			} else {
+				fmt.Printf("Disconnected, will attempt reconnects\n")
+			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			fmt.Printf("Reconnected [%s]\n", nc.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			fmt.Printf("Exiting: %v\n", nc.LastError())
+			if lastErr := nc.LastError(); lastErr != nil {
+				fmt.Printf("Exiting: %v\n", lastErr)
+			} else {
+				fmt.Printf("Exiting: connection closed\n")
+			}
 		}),
 	)
 	if err != nil {
@@ -113,9 +121,22 @@ func (nc *NATSClient) PublishMessage(subject string, data []byte) error {
 	return nil
 }
 
-// Close closes the NATS connection.
+// Close gracefully closes the NATS connection by draining pending messages.
 func (nc *NATSClient) Close() error {
-	nc.conn.Close()
+	if nc.conn == nil {
+		return nil
+	}
+
+	if nc.conn.IsClosed() {
+		return nil
+	}
+
+	err := nc.conn.Drain()
+	if err != nil {
+		nc.conn.Close()
+		return fmt.Errorf("failed to drain NATS connection: %w", err)
+	}
+
 	return nil
 }
 

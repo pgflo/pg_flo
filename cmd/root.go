@@ -428,18 +428,43 @@ func runWorker(cmd *cobra.Command, _ []string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	errCh := make(chan error, 1)
 	go func() {
-		<-sigCh
-		cancel()
+		errCh <- w.Start(ctx)
 	}()
 
 	log.Info().Msg("Starting worker...")
-	if err := w.Start(ctx); err != nil {
-		if err == context.Canceled {
-			log.Info().Msg("Worker shut down gracefully")
-		} else {
-			log.Error().Err(err).Msg("Worker encountered an error during shutdown")
+
+	select {
+	case sig := <-sigCh:
+		log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+
+		// Create a new context with timeout for graceful shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		// Cancel the main context first to trigger graceful shutdown
+		cancel()
+
+		// Wait for worker to finish gracefully or timeout
+		select {
+		case err := <-errCh:
+			if err == context.Canceled {
+				log.Info().Msg("Worker shut down gracefully")
+			} else {
+				log.Error().Err(err).Msg("Worker encountered an error during shutdown")
+			}
+		case <-shutdownCtx.Done():
+			log.Error().Msg("Worker shutdown timeout exceeded")
+			os.Exit(1)
 		}
+
+	case err := <-errCh:
+		if err != nil {
+			log.Error().Err(err).Msg("Worker error occurred")
+			os.Exit(1)
+		}
+		log.Info().Msg("Worker completed successfully")
 	}
 }
 

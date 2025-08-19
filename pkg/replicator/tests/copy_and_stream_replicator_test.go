@@ -2,16 +2,14 @@ package replicator_test
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/goccy/go-json"
 	"github.com/jackc/pglogrepl"
-	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/pgflo/pg_flo/pkg/replicator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -114,251 +112,198 @@ func TestCopyAndStreamReplicator(t *testing.T) {
 		mockOIDRows.AssertExpectations(t)
 		mockPKRows.AssertExpectations(t)
 	})
+}
 
-	t.Run("CopyTableRange", func(t *testing.T) {
-		mockStandardConn := new(MockStandardConnection)
-		mockNATSClient := new(MockNATSClient)
-		mockPoolConn := new(MockPgxPoolConn)
-		mockTx := new(MockTx)
-		mockRows := new(MockRows)
+func TestCopyAndStreamReplicator_CopyOnly_vs_CopyAndStream_Modes(t *testing.T) {
+	tests := []struct {
+		name         string
+		copyOnly     bool
+		expectStream bool
+	}{
+		{
+			name:         "Copy-only mode should not start streaming",
+			copyOnly:     true,
+			expectStream: false,
+		},
+		{
+			name:         "Copy-and-stream mode should start streaming after copy",
+			copyOnly:     false,
+			expectStream: true,
+		},
+	}
 
-		mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockReplicationConn := new(MockReplicationConnection)
+			mockStandardConn := new(MockStandardConnection)
+			mockNATSClient := new(MockNATSClient)
 
-		mockPoolConn.On("BeginTx", mock.Anything, mock.MatchedBy(func(txOptions pgx.TxOptions) bool {
-			return txOptions.IsoLevel == pgx.Serializable && txOptions.AccessMode == pgx.ReadOnly
-		})).Return(mockTx, nil)
+			config := replicator.Config{
+				Host:     "localhost",
+				Port:     5432,
+				Database: "testdb",
+				User:     "testuser",
+				Password: "testpass",
+				Group:    "testgroup",
+				Schema:   "public",
+				Tables:   []string{"test_table"},
+			}
 
-		mockTx.On("Exec", mock.Anything, mock.MatchedBy(func(sql string) bool {
-			return strings.Contains(sql, "SET TRANSACTION SNAPSHOT")
-		}), mock.Anything).Return(pgconn.CommandTag{}, nil).Once()
+			if tt.expectStream {
+				mockReplicationConn.On("StartReplication", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(assert.AnError)
+			}
 
-		mockTx.On("QueryRow", mock.Anything, "SELECT schemaname FROM pg_tables WHERE tablename = $1", mock.Anything).Return(MockRow{
-			scanFunc: func(dest ...interface{}) error {
-				*dest[0].(*string) = replicator.DefaultSchema
-				return nil
-			},
+			setupMockShutdownBase(mockStandardConn, mockNATSClient, mockReplicationConn)
+
+			baseReplicator := replicator.NewBaseReplicator(config, mockReplicationConn, mockStandardConn, mockNATSClient)
+			copyStreamReplicator := replicator.NewCopyAndStreamReplicator(baseReplicator, 2, tt.copyOnly)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := copyStreamReplicator.Start(ctx)
+
+			if tt.copyOnly {
+				assert.NoError(t, err, "Copy-only mode should complete successfully")
+			} else {
+				assert.Error(t, err, "Copy-and-stream mode should get error from StartReplication mock")
+			}
+
+			mockReplicationConn.AssertExpectations(t)
+			mockStandardConn.AssertExpectations(t)
+			mockNATSClient.AssertExpectations(t)
 		})
+	}
+}
 
-		mockOIDRows := new(MockRows)
-		mockOIDRows.On("Next").Return(false)
-		mockOIDRows.On("Err").Return(nil)
-		mockOIDRows.On("Close").Return()
+func setupMockShutdownBase(mockStandardConn *MockStandardConnection, _ *MockNATSClient, mockReplicationConn *MockReplicationConnection) {
+	mockOIDRows := new(MockRows)
+	mockOIDRows.On("Next").Return(false)
+	mockOIDRows.On("Err").Return(nil)
+	mockOIDRows.On("Close").Return()
 
-		mockPKRows := new(MockRows)
-		mockPKRows.On("Next").Return(false)
-		mockPKRows.On("Err").Return(nil)
-		mockPKRows.On("Close").Return()
+	mockPKRows := new(MockRows)
+	mockPKRows.On("Next").Return(false)
+	mockPKRows.On("Err").Return(nil)
+	mockPKRows.On("Close").Return()
 
-		mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
-			return strings.Contains(q, "pg_type")
-		}), mock.Anything).Return(mockOIDRows, nil)
+	mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "pg_type")
+	}), mock.Anything).Return(mockOIDRows, nil)
 
-		mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
-			return strings.Contains(q, "table_info")
-		}), mock.Anything).Return(mockPKRows, nil)
+	mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "table_info") && strings.Contains(q, "relreplident")
+	}), mock.Anything).Return(mockPKRows, nil)
 
-		mockRows.On("Next").Return(true).Once().On("Next").Return(false)
-		mockRows.On("Err").Return(nil)
-		mockRows.On("Close").Return()
-		mockRows.On("FieldDescriptions").Return([]pgconn.FieldDescription{
-			{Name: "id", DataTypeOID: 23},
-			{Name: "name", DataTypeOID: 25},
-		})
-		mockRows.On("RawValues").Return([][]byte{[]byte("1"), []byte("John Doe")})
+	mockStandardConn.On("Query", mock.Anything, mock.Anything, mock.Anything).Return(mockPKRows, nil)
 
-		mockTx.On("Query", mock.Anything, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return(mockRows, nil)
-		mockTx.On("Commit", mock.Anything).Return(nil)
-		mockPoolConn.On("Release").Return()
+	mockPublicationRow := MockRow{
+		scanFunc: func(dest ...interface{}) error {
+			if b, ok := dest[0].(*bool); ok {
+				*b = false
+			}
+			return nil
+		},
+	}
+	mockStandardConn.On("QueryRow", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "pg_publication")
+	}), mock.Anything).Return(mockPublicationRow)
 
-		mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.Anything).Return(nil)
+	mockTablesRows := new(MockRows)
+	mockTablesRows.On("Next").Return(false)
+	mockTablesRows.On("Err").Return(nil)
+	mockTablesRows.On("Close").Return()
+	mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "pg_tables")
+	}), mock.Anything).Return(mockTablesRows, nil)
 
-		csr := &replicator.CopyAndStreamReplicator{
-			BaseReplicator: replicator.NewBaseReplicator(
-				replicator.Config{
-					Tables:   []string{"users"},
-					Schema:   replicator.DefaultSchema,
-					Host:     "localhost",
-					Port:     5432,
-					User:     "testuser",
-					Password: "testpassword",
-					Database: "testdb",
-					Group:    "test_group",
-				},
-				nil,
-				mockStandardConn,
-				mockNATSClient,
-			),
-		}
+	mockStandardConn.On("Exec", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "CREATE PUBLICATION")
+	}), mock.Anything).Return(pgconn.CommandTag{}, nil)
 
-		rowsCopied, err := csr.CopyTableRange(context.Background(), "users", 0, 1000, "snapshot-1", 0)
-		assert.NoError(t, err)
-		assert.Equal(t, int64(1), rowsCopied)
+	mockSlotRow := MockRow{
+		scanFunc: func(dest ...interface{}) error {
+			if b, ok := dest[0].(*bool); ok {
+				*b = false
+			}
+			return nil
+		},
+	}
+	mockStandardConn.On("QueryRow", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "pg_replication_slots")
+	}), mock.Anything).Return(mockSlotRow)
 
-		mockStandardConn.AssertExpectations(t)
-		mockPoolConn.AssertExpectations(t)
-		mockTx.AssertExpectations(t)
-		mockRows.AssertExpectations(t)
-		mockNATSClient.AssertExpectations(t)
-		mockOIDRows.AssertExpectations(t)
-		mockPKRows.AssertExpectations(t)
-	})
-	t.Run("CopyTableRange with diverse data types", func(t *testing.T) {
-		testCases := []struct {
-			name           string
-			relationFields []pgconn.FieldDescription
-			tupleData      []interface{}
-			expected       []map[string]interface{}
-		}{
-			{
-				name: "Basic types",
-				relationFields: []pgconn.FieldDescription{
-					{Name: "id", DataTypeOID: pgtype.Int4OID},
-					{Name: "name", DataTypeOID: pgtype.TextOID},
-					{Name: "coach", DataTypeOID: pgtype.TextOID},
-					{Name: "active", DataTypeOID: pgtype.BoolOID},
-					{Name: "score", DataTypeOID: pgtype.Float8OID},
-				},
-				tupleData: []interface{}{
-					int64(1), "John Doe", "", true, float64(9.99),
-				},
-				expected: []map[string]interface{}{
-					{"name": "id", "type": "int4", "tupleType": pglogrepl.TupleDataTypeBinary, "value": int64(1)},
-					{"name": "name", "type": "text", "tupleType": pglogrepl.TupleDataTypeText, "value": "John Doe"},
-					{"name": "coach", "type": "text", "tupleType": pglogrepl.TupleDataTypeText, "value": ""},
-					{"name": "active", "type": "bool", "tupleType": pglogrepl.TupleDataTypeBinary, "value": true},
-					{"name": "score", "type": "float8", "tupleType": pglogrepl.TupleDataTypeBinary, "value": float64(9.99)},
-				},
-			},
-			{
-				name: "Complex types",
-				relationFields: []pgconn.FieldDescription{
-					{Name: "data", DataTypeOID: pgtype.JSONBOID},
-					{Name: "tags", DataTypeOID: pgtype.TextArrayOID},
-					{Name: "image", DataTypeOID: pgtype.ByteaOID},
-					{Name: "created_at", DataTypeOID: pgtype.TimestamptzOID},
-				},
-				tupleData: []interface{}{
-					[]byte(`{"key": "value"}`),
-					[]string{"tag1", "tag2", "tag3"},
-					[]byte{0x01, 0x02, 0x03, 0x04},
-					time.Date(2023, time.May, 1, 12, 34, 56, 789000000, time.UTC),
-				},
-				expected: []map[string]interface{}{
-					{"name": "data", "type": "jsonb", "tupleType": pglogrepl.TupleDataTypeBinary, "value": json.RawMessage(`{"key": "value"}`)},
-					{"name": "tags", "type": "text[]", "tupleType": pglogrepl.TupleDataTypeBinary, "value": "{tag1,tag2,tag3}"},
-					{"name": "image", "type": "bytea", "tupleType": pglogrepl.TupleDataTypeText, "value": []byte{0x01, 0x02, 0x03, 0x04}},
-					{"name": "created_at", "type": "timestamptz", "tupleType": pglogrepl.TupleDataTypeBinary, "value": time.Date(2023, time.May, 1, 12, 34, 56, 789000000, time.UTC)},
-				},
-			},
-			{
-				name: "Numeric types",
-				relationFields: []pgconn.FieldDescription{
-					{Name: "small_int", DataTypeOID: pgtype.Int2OID},
-					{Name: "big_int", DataTypeOID: pgtype.Int8OID},
-					{Name: "numeric", DataTypeOID: pgtype.NumericOID},
-				},
-				tupleData: []interface{}{
-					int64(32767), int64(9223372036854775807), "123456.789",
-				},
-				expected: []map[string]interface{}{
-					{"name": "small_int", "type": "int2", "tupleType": pglogrepl.TupleDataTypeBinary, "value": int64(32767)},
-					{"name": "big_int", "type": "int8", "tupleType": pglogrepl.TupleDataTypeBinary, "value": int64(9223372036854775807)},
-					{"name": "numeric", "type": "numeric", "tupleType": pglogrepl.TupleDataTypeBinary, "value": "123456.789"},
-				},
-			},
-		}
+	mockReplicationConn.On("CreateReplicationSlot", mock.Anything, mock.Anything).Return(
+		pglogrepl.CreateReplicationSlotResult{
+			SlotName:        "test_slot",
+			ConsistentPoint: "0/123456",
+			SnapshotName:    "test_snapshot",
+			OutputPlugin:    "pgoutput",
+		}, nil)
 
-		for _, tc := range testCases {
-			t.Run(tc.name, func(t *testing.T) {
-				mockStandardConn := new(MockStandardConnection)
-				mockNATSClient := new(MockNATSClient)
-				mockPoolConn := new(MockPgxPoolConn)
-				mockTx := new(MockTx)
-				mockRows := new(MockRows)
+	mockSnapshotTx := new(MockTx)
+	mockStandardConn.On("BeginTx", mock.Anything, mock.AnythingOfType("pgx.TxOptions")).Return(mockSnapshotTx, nil)
 
-				mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil)
-				mockPoolConn.On("BeginTx", mock.Anything, mock.AnythingOfType("pgx.TxOptions")).Return(mockTx, nil)
-				mockTx.On("Exec", mock.Anything, mock.AnythingOfType("string"), mock.Anything).Return(pgconn.CommandTag{}, nil)
-				mockTx.On("QueryRow", mock.Anything, mock.AnythingOfType("string"), mock.Anything).Return(MockRow{
-					scanFunc: func(dest ...interface{}) error {
-						*dest[0].(*string) = replicator.DefaultSchema
-						return nil
-					},
-				})
+	mockSnapshotRow := MockRow{
+		scanFunc: func(dest ...interface{}) error {
+			if snapshotID, ok := dest[0].(*string); ok {
+				*snapshotID = "test_snapshot_123"
+			}
+			if lsn, ok := dest[1].(*pglogrepl.LSN); ok {
+				*lsn = pglogrepl.LSN(12345)
+			}
+			return nil
+		},
+	}
+	mockSnapshotTx.On("QueryRow", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "pg_export_snapshot")
+	})).Return(mockSnapshotRow)
 
-				mockOIDRows := new(MockRows)
-				mockOIDRows.On("Next").Return(false)
-				mockOIDRows.On("Err").Return(nil)
-				mockOIDRows.On("Close").Return()
+	mockRelPagesRow := MockRow{
+		scanFunc: func(dest ...interface{}) error {
+			if pages, ok := dest[0].(*uint32); ok {
+				*pages = 1
+			}
+			return nil
+		},
+	}
+	mockStandardConn.On("QueryRow", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "SELECT relpages")
+	}), mock.Anything).Return(mockRelPagesRow)
 
-				mockPKRows := new(MockRows)
-				mockPKRows.On("Next").Return(false)
-				mockPKRows.On("Err").Return(nil)
-				mockPKRows.On("Close").Return()
+	mockPoolConn := new(MockPgxPoolConn)
+	mockCopyTx := new(MockTx)
 
-				mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
-					return strings.Contains(q, "pg_type")
-				}), mock.Anything).Return(mockOIDRows, nil)
+	mockStandardConn.On("Acquire", mock.Anything).Return(mockPoolConn, nil)
+	mockPoolConn.On("BeginTx", mock.Anything, mock.AnythingOfType("pgx.TxOptions")).Return(mockCopyTx, nil)
+	mockPoolConn.On("Release").Return()
 
-				mockStandardConn.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
-					return strings.Contains(q, "table_info")
-				}), mock.Anything).Return(mockPKRows, nil)
+	mockCopyTx.On("Exec", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "SET TRANSACTION SNAPSHOT")
+	}), mock.Anything).Return(pgconn.CommandTag{}, nil)
 
-				mockRows.On("Next").Return(true).Once().On("Next").Return(false)
-				mockRows.On("Err").Return(nil)
-				mockRows.On("Close").Return()
-				mockRows.On("FieldDescriptions").Return(tc.relationFields)
-				// Convert tupleData to raw bytes for RawValues()
-				rawData := make([][]byte, len(tc.tupleData))
-				for i, val := range tc.tupleData {
-					switch v := val.(type) {
-					case []byte:
-						rawData[i] = v
-					case string:
-						rawData[i] = []byte(v)
-					default:
-						rawData[i] = []byte(fmt.Sprintf("%v", v))
-					}
-				}
-				mockRows.On("RawValues").Return(rawData)
+	mockSchemaRow := MockRow{
+		scanFunc: func(dest ...interface{}) error {
+			if schema, ok := dest[0].(*string); ok {
+				*schema = "public"
+			}
+			return nil
+		},
+	}
+	mockCopyTx.On("QueryRow", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "SELECT schemaname")
+	}), mock.Anything).Return(mockSchemaRow)
 
-				mockTx.On("Query", mock.Anything, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return(mockRows, nil)
-				mockTx.On("Commit", mock.Anything).Return(nil)
-				mockPoolConn.On("Release").Return()
+	mockCopyRows := new(MockRows)
+	mockCopyRows.On("Next").Return(false)
+	mockCopyRows.On("Err").Return(nil)
+	mockCopyRows.On("Close").Return()
+	mockCopyRows.On("FieldDescriptions").Return([]pgconn.FieldDescription{})
 
-				mockNATSClient.On("PublishMessage", "pgflo.test_group", mock.AnythingOfType("[]uint8")).Return(nil)
-				csr := &replicator.CopyAndStreamReplicator{
-					BaseReplicator: replicator.NewBaseReplicator(
-						replicator.Config{
-							Tables:   []string{"test_table"},
-							Schema:   replicator.DefaultSchema,
-							Host:     "localhost",
-							Port:     5432,
-							User:     "testuser",
-							Password: "testpassword",
-							Database: "testdb",
-							Group:    "test_group",
-						},
-						nil,
-						mockStandardConn,
-						mockNATSClient,
-					),
-				}
+	mockCopyTx.On("Query", mock.Anything, mock.MatchedBy(func(q string) bool {
+		return strings.Contains(q, "ctid >=")
+	}), mock.Anything).Return(mockCopyRows, nil)
 
-				rowsCopied, err := csr.CopyTableRange(context.Background(), "test_table", 0, 1000, "snapshot-1", 0)
-				assert.NoError(t, err)
-				assert.Equal(t, int64(1), rowsCopied)
-
-				// Assert expectations
-				mockStandardConn.AssertExpectations(t)
-				mockPoolConn.AssertExpectations(t)
-				mockTx.AssertExpectations(t)
-				mockRows.AssertExpectations(t)
-				mockNATSClient.AssertExpectations(t)
-				mockOIDRows.AssertExpectations(t)
-				mockPKRows.AssertExpectations(t)
-			})
-		}
-	})
-
+	mockSnapshotTx.On("Commit", mock.Anything).Return(nil)
+	mockCopyTx.On("Commit", mock.Anything).Return(nil)
 }

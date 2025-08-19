@@ -267,7 +267,10 @@ func (r *BaseReplicator) reconnectAndStartReplication(ctx context.Context) error
 		}
 	}
 
+	r.mu.RLock()
 	startLSN := r.LastLSN
+	r.mu.RUnlock()
+
 	if startLSN == 0 {
 		lastLSN, err := r.GetLastState()
 		if err != nil {
@@ -526,7 +529,10 @@ func (r *BaseReplicator) HandleCommitMessage(msg *pglogrepl.CommitMessage) error
 		}
 	}
 
+	r.mu.Lock()
 	r.LastLSN = msg.CommitLSN
+	r.mu.Unlock()
+
 	if err := r.SaveState(msg.CommitLSN); err != nil {
 		r.Logger.Error().Err(err).Msg("Failed to save replication state")
 		return err
@@ -561,10 +567,14 @@ func (r *BaseReplicator) PublishToNATS(data utils.CDCMessage) error {
 
 // SendStandbyStatusUpdate sends a status update to the primary server
 func (r *BaseReplicator) SendStandbyStatusUpdate(ctx context.Context) error {
+	r.mu.RLock()
+	lastLSN := r.LastLSN
+	r.mu.RUnlock()
+
 	err := r.ReplicationConn.SendStandbyStatusUpdate(ctx, pglogrepl.StandbyStatusUpdate{
-		WALWritePosition: r.LastLSN + 1,
-		WALFlushPosition: r.LastLSN + 1,
-		WALApplyPosition: r.LastLSN + 1,
+		WALWritePosition: lastLSN + 1,
+		WALFlushPosition: lastLSN + 1,
+		WALApplyPosition: lastLSN + 1,
 		ClientTime:       time.Now(),
 		ReplyRequested:   false,
 	})
@@ -572,7 +582,7 @@ func (r *BaseReplicator) SendStandbyStatusUpdate(ctx context.Context) error {
 		return fmt.Errorf("failed to send standby status update: %w", err)
 	}
 
-	r.Logger.Debug().Str("lsn", r.LastLSN.String()).Msg("Sent standby status update")
+	r.Logger.Debug().Str("lsn", lastLSN.String()).Msg("Sent standby status update")
 	return nil
 }
 
@@ -626,7 +636,11 @@ func (r *BaseReplicator) GracefulShutdown(ctx context.Context) error {
 		}
 	}
 
-	if err := r.SaveState(r.LastLSN); err != nil {
+	r.mu.RLock()
+	finalLSN := r.LastLSN
+	r.mu.RUnlock()
+
+	if err := r.SaveState(finalLSN); err != nil {
 		r.Logger.Warn().Err(err).Msg("Failed to save final state")
 	}
 
