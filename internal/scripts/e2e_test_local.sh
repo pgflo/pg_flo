@@ -29,7 +29,7 @@ cleanup() {
 
 trap cleanup EXIT
 
-make build-ci
+make build
 
 setup_docker
 

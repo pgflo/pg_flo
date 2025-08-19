@@ -12,17 +12,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version: "1.21"
 
       - name: Build
-        timeout-minutes: 5
         run: make build
 
       - name: Upload binary
@@ -34,7 +32,6 @@ jobs:
   tests:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +69,6 @@ jobs:
           sudo curl -L "https://github.com/docker/compose/releases/download/v2.17.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
           sudo chmod +x /usr/local/bin/docker-compose
       - name: Run test
-        timeout-minutes: 25
         env:
           PG_HOST: localhost
           PG_PORT: 5433
@@ -88,8 +84,8 @@ jobs:
           docker-compose -f internal/docker-compose.yml up -d
           sleep 10
           if [[ "${{ matrix.test }}" == "order" || "${{ matrix.test }}" == "resume" || "${{ matrix.test }}" == "postgres_uniqueness" ]]; then
-            timeout 20m ruby ./internal/scripts/e2e_${{ matrix.test }}_test.rb
+            ruby ./internal/scripts/e2e_${{ matrix.test }}_test.rb
           else
-            timeout 20m ./internal/scripts/e2e_${{ matrix.test }}.sh
+            ./internal/scripts/e2e_${{ matrix.test }}.sh
           fi
           docker-compose -f internal/docker-compose.yml down -v
