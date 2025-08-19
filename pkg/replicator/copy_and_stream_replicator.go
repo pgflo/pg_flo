@@ -43,11 +43,7 @@ func (r *CopyAndStreamReplicator) Start(ctx context.Context) error {
 		return nil
 	}
 
-	r.mu.RLock()
-	currentLSN := r.LastLSN
-	r.mu.RUnlock()
-
-	return r.StartReplicationFromLSN(ctx, currentLSN, r.stopChan)
+	return r.StartReplicationFromLSN(ctx, r.LastLSN, r.stopChan)
 }
 
 // Stop stops the copy and stream replicator
@@ -62,28 +58,20 @@ func (r *CopyAndStreamReplicator) ParallelCopy(ctx context.Context) error {
 		return err
 	}
 
-	snapshotID, startLSN, err := r.getSnapshotInfo(ctx, tx)
+	snapshotID, startLSN, err := r.getSnapshotInfo(tx)
 	if err != nil {
 		return err
 	}
 
 	r.Logger.Info().Str("snapshotID", snapshotID).Str("startLSN", startLSN.String()).Msg("Starting parallel copy")
 
-	r.mu.Lock()
 	r.LastLSN = startLSN
-	r.mu.Unlock()
 
 	if err := r.CopyTables(ctx, r.Config.Tables, snapshotID); err != nil {
 		return err
 	}
 
-	if ctx.Err() != nil {
-		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-			r.Logger.Error().Err(rollbackErr).Msg("Failed to rollback snapshot transaction after context cancellation")
-		}
-		return ctx.Err()
-	}
-	return tx.Commit(ctx)
+	return tx.Commit(context.Background())
 }
 
 // startSnapshotTransaction starts a new transaction with serializable isolation level.
@@ -95,10 +83,10 @@ func (r *CopyAndStreamReplicator) startSnapshotTransaction(ctx context.Context) 
 }
 
 // getSnapshotInfo retrieves the snapshot ID and current WAL LSN.
-func (r *CopyAndStreamReplicator) getSnapshotInfo(ctx context.Context, tx pgx.Tx) (string, pglogrepl.LSN, error) {
+func (r *CopyAndStreamReplicator) getSnapshotInfo(tx pgx.Tx) (string, pglogrepl.LSN, error) {
 	var snapshotID string
 	var startLSN pglogrepl.LSN
-	err := tx.QueryRow(ctx, `
+	err := tx.QueryRow(context.Background(), `
 		SELECT pg_export_snapshot(), pg_current_wal_lsn()::text::pg_lsn
 	`).Scan(&snapshotID, &startLSN)
 	if err != nil {
@@ -112,40 +100,20 @@ func (r *CopyAndStreamReplicator) CopyTables(ctx context.Context, tables []strin
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(tables))
 
-	copyCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	for _, table := range tables {
 		wg.Add(1)
 		go func(tableName string) {
 			defer wg.Done()
-			if err := r.CopyTable(copyCtx, tableName, snapshotID); err != nil {
-				if copyCtx.Err() != nil {
-					r.Logger.Info().Str("table", tableName).Msg("Table copy canceled due to context cancellation")
-					return
-				}
+			if err := r.CopyTable(ctx, tableName, snapshotID); err != nil {
 				errChan <- fmt.Errorf("failed to copy table %s: %v", tableName, err)
 			}
 		}(table)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+	wg.Wait()
+	close(errChan)
 
-	select {
-	case <-ctx.Done():
-		r.Logger.Info().Msg("Context canceled, cancelling all copy operations")
-		cancel()
-		<-done
-		close(errChan)
-		return ctx.Err()
-	case <-done:
-		close(errChan)
-		return r.collectErrors(errChan)
-	}
+	return r.collectErrors(errChan)
 }
 
 // CopyTable copies a single table using multiple workers.
@@ -210,19 +178,12 @@ func (r *CopyAndStreamReplicator) CopyTableWorker(ctx context.Context, wg *sync.
 	defer wg.Done()
 
 	for rng := range rangesChan {
-		select {
-		case <-ctx.Done():
-			r.Logger.Info().Int("workerID", workerID).Msg("Copy worker canceled due to context cancellation")
-			return
-		default:
-		}
-
 		startPage, endPage := rng[0], rng[1]
 
 		rowsCopied, err := r.CopyTableRange(ctx, tableName, startPage, endPage, snapshotID, workerID)
 		if err != nil {
-			if err == context.Canceled || ctx.Err() != nil {
-				r.Logger.Info().Int("workerID", workerID).Msg("Copy operation canceled")
+			if err == context.Canceled {
+				r.Logger.Info().Msg("Copy operation canceled")
 				return
 			}
 			r.Logger.Err(err).Msg("Failed to copy table range")
@@ -250,14 +211,8 @@ func (r *CopyAndStreamReplicator) CopyTableRange(ctx context.Context, tableName 
 		return 0, fmt.Errorf("failed to start transaction: %v", err)
 	}
 	defer func() {
-		if ctx.Err() != nil {
-			if err := tx.Rollback(ctx); err != nil {
-				r.Logger.Error().Err(err).Msg("Failed to rollback transaction after context cancellation")
-			}
-		} else {
-			if err := tx.Commit(ctx); err != nil {
-				r.Logger.Error().Err(err).Msg("Failed to commit transaction")
-			}
+		if err := tx.Commit(ctx); err != nil {
+			r.Logger.Error().Err(err).Msg("Failed to commit transaction")
 		}
 	}()
 

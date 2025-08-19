@@ -32,20 +32,14 @@ func (r *StreamReplicator) Start(ctx context.Context) error {
 
 	r.Logger.Info().Str("startLSN", startLSN.String()).Msg("Starting replication")
 
-	replicationCtx, replicationCancel := context.WithCancel(ctx)
-	defer replicationCancel()
-
 	errChan := make(chan error, 1)
 	go func() {
-		defer close(errChan)
-		errChan <- r.StartReplicationFromLSN(replicationCtx, startLSN, r.stopChan)
+		errChan <- r.StartReplicationFromLSN(ctx, startLSN, r.stopChan)
 	}()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-r.stopChan:
-		return nil
 	case err := <-errChan:
 		return err
 	}

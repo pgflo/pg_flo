@@ -1,25 +1,23 @@
-.PHONY: test lint build build-ci build-prod clean check test-short
+.PHONY: test lint build clean
 
-.DEFAULT_GOAL := build-prod
+# Define the default goal
+.DEFAULT_GOAL := build
 
-build: build-prod
-
-build-ci:
-	go build -race -o bin/pg_flo
-
-build-prod:
+# Build the application
+build:
 	go build -o bin/pg_flo
 
+# Run tests with race detection and coverage
 test:
 	go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
-test-short:
-	go test -v -race -short -timeout=5m ./...
-
+# Run linter
 lint:
 	golangci-lint run --timeout=5m
 
+# Clean build artifacts
 clean:
 	rm -rf bin/ coverage.txt
 
+# Run all checks (lint and test)
 check: lint test
