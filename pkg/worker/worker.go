@@ -31,6 +31,7 @@ type Worker struct {
 	logger         utils.Logger
 	batchSize      int
 	buffer         []*utils.CDCMessage
+	ackBuffer      []*nats.Msg
 	lastSavedState uint64
 	flushInterval  time.Duration
 	shutdownCh     chan struct{}
@@ -65,6 +66,7 @@ func NewWorker(natsClient *pgflonats.NATSClient, ruleEngine *rules.RuleEngine, r
 		logger:         logger,
 		batchSize:      1000,
 		buffer:         make([]*utils.CDCMessage, 0, 1000),
+		ackBuffer:      make([]*nats.Msg, 0, 1000),
 		lastSavedState: 0,
 		flushInterval:  500 * time.Millisecond,
 		shutdownCh:     make(chan struct{}),
@@ -74,6 +76,7 @@ func NewWorker(natsClient *pgflonats.NATSClient, ruleEngine *rules.RuleEngine, r
 		opt(w)
 	}
 	w.buffer = make([]*utils.CDCMessage, 0, w.batchSize)
+	w.ackBuffer = make([]*nats.Msg, 0, w.batchSize)
 
 	return w
 }
@@ -97,7 +100,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		Durable:       consumerName,
 		FilterSubject: subject,
 		AckPolicy:     nats.AckExplicitPolicy,
-		MaxDeliver:    1,
+		MaxDeliver:    20,
 		AckWait:       25 * time.Minute,
 		DeliverPolicy: nats.DeliverAllPolicy,
 	}
@@ -146,7 +149,7 @@ func (w *Worker) processMessages(ctx context.Context, sub *nats.Subscription) er
 				w.logger.Error().Err(err).Msg("Failed to flush buffer on interval")
 			}
 		default:
-			msgs, err := sub.Fetch(10, nats.MaxWait(500*time.Millisecond))
+			msgs, err := sub.Fetch(w.batchSize, nats.MaxWait(1*time.Second))
 			if err != nil && !errors.Is(err, nats.ErrTimeout) {
 				w.logger.Error().Err(err).Msg("Error fetching messages")
 				continue
@@ -155,9 +158,9 @@ func (w *Worker) processMessages(ctx context.Context, sub *nats.Subscription) er
 			for _, msg := range msgs {
 				if err := w.processMessage(msg); err != nil {
 					w.logger.Error().Err(err).Msg("Failed to process message")
-				}
-				if err := msg.Ack(); err != nil {
-					w.logger.Error().Err(err).Msg("Failed to acknowledge message")
+					if ackErr := msg.Ack(); ackErr != nil {
+						w.logger.Error().Err(ackErr).Msg("Failed to acknowledge failed message")
+					}
 				}
 			}
 			if len(w.buffer) >= w.batchSize {
@@ -194,6 +197,9 @@ func (w *Worker) processMessage(msg *nats.Msg) error {
 		}
 		if processedMessage == nil {
 			w.logger.Debug().Msg("Message filtered out by rules")
+			if ackErr := msg.Ack(); ackErr != nil {
+				w.logger.Error().Err(ackErr).Msg("Failed to acknowledge filtered message")
+			}
 			return nil
 		}
 		cdcMessage = *processedMessage
@@ -207,11 +213,15 @@ func (w *Worker) processMessage(msg *nats.Msg) error {
 		}
 		if routedMessage == nil {
 			w.logger.Debug().Msg("Message filtered out by routing")
+			if ackErr := msg.Ack(); ackErr != nil {
+				w.logger.Error().Err(ackErr).Msg("Failed to acknowledge filtered message")
+			}
 			return nil
 		}
 		cdcMessage = *routedMessage
 	}
 
+	w.ackBuffer = append(w.ackBuffer, msg)
 	w.buffer = append(w.buffer, &cdcMessage)
 	w.lastSavedState = metadata.Sequence.Stream
 
@@ -229,10 +239,18 @@ func (w *Worker) flushBuffer() error {
 		Int("batch_size", w.batchSize).
 		Msg("Flushing buffer")
 
+	// Write to sink first - if this fails, messages remain unacked for redelivery
 	err := w.sink.WriteBatch(w.buffer)
 	if err != nil {
 		w.logger.Error().Err(err).Msg("Failed to write batch to sink")
 		return err
+	}
+
+	for _, msg := range w.ackBuffer {
+		if ackErr := msg.Ack(); ackErr != nil {
+			w.logger.Error().Err(ackErr).Msg("Failed to acknowledge message after successful write")
+			// Continue acking other messages even if one fails
+		}
 	}
 
 	state, err := w.natsClient.GetState()
@@ -248,5 +266,6 @@ func (w *Worker) flushBuffer() error {
 	}
 
 	w.buffer = w.buffer[:0]
+	w.ackBuffer = w.ackBuffer[:0]
 	return nil
 }
