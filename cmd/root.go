@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pgflo/pg_flo/pkg/direct"
 	"github.com/pgflo/pg_flo/pkg/pgflonats"
 	"github.com/pgflo/pg_flo/pkg/replicator"
 	"github.com/pgflo/pg_flo/pkg/routing"
@@ -69,6 +70,13 @@ var (
 		Run:   runWorker,
 	}
 
+	directReplicatorCmd = &cobra.Command{
+		Use:   "direct-replicator",
+		Short: "Start the direct sink replicator",
+		Long:  `Start the direct sink replicator for high-performance CDC with commit lock pattern and parquet output`,
+		Run:   runDirectReplicator,
+	}
+
 	// Version information set by goreleaser
 	version = "dev"
 	commit  = "none"
@@ -102,7 +110,7 @@ func init() {
 	addWorkerFlags(workerCmd)
 
 	workerCmd.AddCommand(stdoutWorkerCmd, fileWorkerCmd, postgresWorkerCmd, webhookWorkerCmd)
-	rootCmd.AddCommand(replicatorCmd, workerCmd, versionCmd)
+	rootCmd.AddCommand(replicatorCmd, workerCmd, directReplicatorCmd, versionCmd)
 
 	cobra.OnInitialize(func() {
 		if len(os.Args) > 1 && os.Args[1] != "version" && cfgFile == "" {
@@ -539,4 +547,122 @@ func addWorkerFlags(cmd *cobra.Command) {
 
 	// Webhook sink specific flags
 	webhookWorkerCmd.Flags().String("webhook-url", "", "Webhook URL (env: PG_FLO_WEBHOOK_URL)")
+}
+
+// runDirectReplicator starts the direct sink replicator
+func runDirectReplicator(_ *cobra.Command, _ []string) {
+	// Load direct sink configuration from file
+	if cfgFile == "" {
+		log.Fatal().Msg("Direct replicator requires --config flag with direct sink configuration file")
+	}
+
+	var directConfig direct.Config
+	configData, err := os.ReadFile(cfgFile)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to read direct sink config file")
+	}
+
+	if err := yaml.Unmarshal(configData, &directConfig); err != nil {
+		log.Fatal().Err(err).Msg("Failed to parse direct sink config")
+	}
+
+	// Validate required configuration
+	if directConfig.Group == "" {
+		log.Fatal().Msg("Direct sink config requires 'group' field")
+	}
+
+	if directConfig.Source.Host == "" {
+		log.Fatal().Msg("Direct sink config requires 'source.host' field")
+	}
+
+	// Set defaults
+	if directConfig.MaxTablesPerWorker <= 0 {
+		directConfig.MaxTablesPerWorker = 5
+	}
+
+	if directConfig.MaxWorkersPerServer <= 0 {
+		directConfig.MaxWorkersPerServer = 10
+	}
+
+	if directConfig.MaxMemoryBytes <= 0 {
+		directConfig.MaxMemoryBytes = 128 * 1024 * 1024 // 128MB
+	}
+
+	if directConfig.MaxParquetFileSize <= 0 {
+		directConfig.MaxParquetFileSize = 128 * 1024 * 1024 // 128MB
+	}
+
+	// If metadata database is not specified, use source database
+	if directConfig.Metadata.Host == "" {
+		directConfig.Metadata = directConfig.Source
+	}
+
+	// If S3 local path is not specified, use default
+	if directConfig.S3.LocalPath == "" {
+		directConfig.S3.LocalPath = "/tmp/pg_flo_parquet"
+	}
+
+	// Create direct replicator
+	logger := utils.NewZerologLogger(log.With().Str("component", "direct-replicator").Logger())
+
+	directReplicator, err := direct.NewDefaultDirectReplicator(directConfig, logger)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to create direct replicator")
+	}
+
+	// Create base context for the entire application
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup signal handling
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Error channel to capture any replication errors
+	errCh := make(chan error, 1)
+
+	// Start replication in a goroutine
+	go func() {
+		if err := directReplicator.Bootstrap(ctx); err != nil {
+			errCh <- fmt.Errorf("bootstrap failed: %w", err)
+			return
+		}
+
+		if err := directReplicator.Start(ctx); err != nil {
+			errCh <- err
+		}
+	}()
+
+	// Wait for either a signal or an error
+	select {
+	case sig := <-sigCh:
+		log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+
+		// Create a new context with timeout for graceful shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		// Cancel the main context first
+		cancel()
+
+		// Then call Stop with the timeout context
+		if err := directReplicator.Stop(shutdownCtx); err != nil {
+			log.Error().Err(err).Msg("Error during direct replicator shutdown")
+			os.Exit(1)
+		}
+		log.Info().Msg("Direct replicator stopped successfully")
+
+	case err := <-errCh:
+		log.Error().Err(err).Msg("Direct replicator error occurred")
+
+		// Create shutdown context for cleanup
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		// Attempt cleanup even if there was an error
+		if stopErr := directReplicator.Stop(shutdownCtx); stopErr != nil {
+			log.Error().Err(stopErr).Msg("Additional error during shutdown")
+		}
+		os.Exit(1)
+	}
 }

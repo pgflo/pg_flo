@@ -1,0 +1,51 @@
+# Direct Sink Configuration for pg_flo
+# High-performance CDC replication with commit lock pattern and parquet output
+
+# Group name for this replication instance
+group: "direct_sink_test"
+
+# Source PostgreSQL database
+source:
+  host: "localhost"
+  port: 5432
+  database: "postgres"
+  user: "postgres"
+  password: "password"
+
+# Metadata PostgreSQL database (can be same as source)
+metadata:
+  host: "localhost"
+  port: 5432
+  database: "postgres"
+  user: "postgres"
+  password: "password"
+
+# S3/Parquet configuration
+s3:
+  # For local development, use local_path instead of S3
+  local_path: "/tmp/pg_flo_parquet"
+  # For production, configure S3:
+  # bucket: "my-bucket"
+  # region: "us-east-1"
+  # prefix: "pg_flo/data/"
+
+# Schema-based table configuration
+schemas:
+  public:
+    tables:
+      users:
+        sync_mode: "copy-and-stream"
+        include_columns: ["id", "name", "email", "created_at"]
+        # exclude_columns: ["password_hash"]
+      orders:
+        sync_mode: "stream"
+        # include_columns: []  # empty means all columns
+        # exclude_columns: []
+
+# Worker configuration
+max_tables_per_worker: 5
+max_workers_per_server: 10
+
+# Memory and performance configuration
+max_memory_bytes: 134217728 # 128MB
+max_parquet_file_size: 134217728 # 128MB

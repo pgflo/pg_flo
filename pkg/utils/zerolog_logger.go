@@ -68,6 +68,18 @@ func (e *ZerologLogEvent) Uint32(key string, val uint32) LogEvent {
 	return e
 }
 
+// Uint64 adds a 64-bit unsigned integer field to the log event
+func (e *ZerologLogEvent) Uint64(key string, val uint64) LogEvent {
+	e.event = e.event.Uint64(key, val)
+	return e
+}
+
+// Float64 adds a 64-bit float field to the log event
+func (e *ZerologLogEvent) Float64(key string, val float64) LogEvent {
+	e.event = e.event.Float64(key, val)
+	return e
+}
+
 // Interface adds an interface field to the log event
 func (e *ZerologLogEvent) Interface(key string, val interface{}) LogEvent {
 	e.event = e.event.Interface(key, val)

@@ -44,6 +44,67 @@ type CDCMessage struct {
 	ToastedColumns map[string]bool
 }
 
+// GetPrimaryKeyString returns a fast string representation of the primary key for consolidation
+func (m *CDCMessage) GetPrimaryKeyString() string {
+	// Use replication key columns if available, otherwise use first column as fallback
+	keyColumns := m.ReplicationKey.Columns
+	if len(keyColumns) == 0 && len(m.Columns) > 0 {
+		// Fallback to first column (often id/pk)
+		keyColumns = []string{m.Columns[0].Name}
+	}
+
+	if len(keyColumns) == 0 {
+		return "no-key" // Should not happen in practice
+	}
+
+	// Fast path: single column key (most common case)
+	if len(keyColumns) == 1 {
+		return m.getColumnDataAsString(keyColumns[0])
+	}
+
+	// Multi-column key: concatenate with separator
+	var parts []string
+	for _, colName := range keyColumns {
+		parts = append(parts, m.getColumnDataAsString(colName))
+	}
+	return fmt.Sprintf("%v", parts) // Simple array representation
+}
+
+// getColumnDataAsString returns raw column data as string - fast path, no encoding
+func (m *CDCMessage) getColumnDataAsString(columnName string) string {
+	colIndex := m.GetColumnIndex(columnName)
+	if colIndex == -1 {
+		return ""
+	}
+
+	// For CopyData (bulk copy) - direct byte access
+	if m.CopyData != nil && colIndex < len(m.CopyData) {
+		if m.CopyData[colIndex] == nil {
+			return ""
+		}
+		return string(m.CopyData[colIndex]) // Direct conversion, no parsing
+	}
+
+	// For WAL messages - prefer NewTuple, fallback to OldTuple
+	if m.NewTuple != nil && colIndex < len(m.NewTuple.Columns) {
+		tupleCol := m.NewTuple.Columns[colIndex]
+		if tupleCol == nil {
+			return ""
+		}
+		return string(tupleCol.Data) // Direct conversion, no parsing
+	}
+
+	if m.OldTuple != nil && colIndex < len(m.OldTuple.Columns) {
+		tupleCol := m.OldTuple.Columns[colIndex]
+		if tupleCol == nil {
+			return ""
+		}
+		return string(tupleCol.Data) // Direct conversion, no parsing
+	}
+
+	return ""
+}
+
 // GetColumnIndex returns the index of a column by name, or -1 if not found
 func (m *CDCMessage) GetColumnIndex(columnName string) int {
 	for i, col := range m.Columns {

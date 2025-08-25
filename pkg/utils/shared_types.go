@@ -48,6 +48,8 @@ type LogEvent interface {
 	Int64(key string, val int64) LogEvent
 	Uint8(key string, val uint8) LogEvent
 	Uint32(key string, val uint32) LogEvent
+	Uint64(key string, val uint64) LogEvent
+	Float64(key string, val float64) LogEvent
 	Interface(key string, val interface{}) LogEvent
 	Err(err error) LogEvent
 	Strs(key string, vals []string) LogEvent
