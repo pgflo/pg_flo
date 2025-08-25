@@ -38,9 +38,11 @@ func PostgresTypeToArrowType(pgTypeOID uint32) arrow.DataType {
 	case pgtype.TimeOID:
 		return arrow.FixedWidthTypes.Time64us
 	case pgtype.TimestampOID:
+		// PostgreSQL timestamp (no timezone) → Arrow timestamp (no timezone)
 		return arrow.FixedWidthTypes.Timestamp_us
 	case pgtype.TimestamptzOID:
-		return arrow.FixedWidthTypes.Timestamp_us
+		// PostgreSQL timestamptz → Arrow timestamp with UTC timezone
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
 	case pgtype.UUIDOID:
 		return arrow.BinaryTypes.String
 	case pgtype.JSONOID, pgtype.JSONBOID:

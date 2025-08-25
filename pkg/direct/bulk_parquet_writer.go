@@ -201,6 +201,10 @@ func (w *BulkParquetWriter) createCopyRecordBatch(op *utils.CDCMessage) (arrow.R
 			if i < len(op.CopyData) {
 				arr := w.buildCopyArray(pool, field.Type, [][]byte{op.CopyData[i]})
 				arrays = append(arrays, arr)
+			} else {
+				// Missing data - create null array
+				arr := w.buildCopyArray(pool, field.Type, [][]byte{nil})
+				arrays = append(arrays, arr)
 			}
 		}
 	}

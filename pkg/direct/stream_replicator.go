@@ -155,6 +155,9 @@ func (sr *StreamReplicator) startReplicationFromLSN(ctx context.Context, lsn pgl
 func (sr *StreamReplicator) streamingLoop(ctx context.Context) {
 	defer sr.wg.Done()
 
+	lastStatusUpdate := time.Now()
+	standbyMessageTimeout := time.Second * 10
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -165,6 +168,15 @@ func (sr *StreamReplicator) streamingLoop(ctx context.Context) {
 			if err := sr.receiveMessage(ctx); err != nil {
 				sr.logger.Error().Err(err).Msg("Error receiving WAL message")
 				continue
+			}
+
+			// Send periodic standby status updates to keep connection alive
+			if time.Since(lastStatusUpdate) >= standbyMessageTimeout {
+				if err := sr.sendStandbyStatusUpdate(ctx); err != nil {
+					sr.logger.Error().Err(err).Msg("Failed to send standby status update")
+				} else {
+					lastStatusUpdate = time.Now()
+				}
 			}
 		}
 	}
@@ -338,6 +350,11 @@ func (sr *StreamReplicator) handleCommitMessage(msg *pglogrepl.CommitMessage) er
 	if sr.shouldSaveCheckpoint() {
 		if err := sr.saveStreamingCheckpoint(msg.CommitLSN); err != nil {
 			return fmt.Errorf("failed to save streaming checkpoint: %w", err)
+		}
+
+		// Explicitly ack WAL after durable checkpoint and parquet write
+		if err := sr.sendStandbyStatusUpdate(context.Background()); err != nil {
+			sr.logger.Warn().Err(err).Msg("Failed to send standby status update after checkpoint")
 		}
 	}
 
@@ -542,6 +559,23 @@ func (sr *StreamReplicator) createReplicationSlot(ctx context.Context, groupName
 		Str("snapshot_name", result.SnapshotName).
 		Msg("Replication slot created successfully")
 
+	return nil
+}
+
+// sendStandbyStatusUpdate sends a status update to keep the replication connection alive
+func (sr *StreamReplicator) sendStandbyStatusUpdate(ctx context.Context) error {
+	err := sr.replicationConn.SendStandbyStatusUpdate(ctx, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: sr.lastProcessedLSN + 1,
+		WALFlushPosition: sr.lastProcessedLSN + 1,
+		WALApplyPosition: sr.lastProcessedLSN + 1,
+		ClientTime:       time.Now(),
+		ReplyRequested:   false,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send standby status update: %w", err)
+	}
+
+	sr.logger.Debug().Str("lsn", sr.lastProcessedLSN.String()).Msg("Sent standby status update")
 	return nil
 }
 

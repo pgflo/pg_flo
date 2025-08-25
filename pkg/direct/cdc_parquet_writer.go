@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow/go/v15/arrow"
@@ -146,9 +147,10 @@ func (w *CDCParquetWriter) openNewFileForTable(tw *tableWriter, sampleOp *utils.
 		time.Now().Format("20060102_150405"),
 		tw.fileCount)
 
-	filePath := filepath.Join(w.basePath, fileName)
+	finalPath := filepath.Join(w.basePath, fileName)
+	tempPath := finalPath + ".inprogress"
 
-	file, err := os.Create(filePath) //nolint:gosec // Intentional file creation
+	file, err := os.Create(tempPath)
 	if err != nil {
 		return fmt.Errorf("failed to create stream file: %w", err)
 	}
@@ -203,18 +205,18 @@ func (w *CDCParquetWriter) createCDCSchema(op *utils.CDCMessage) *arrow.Schema {
 		for _, col := range op.Columns {
 			fields = append(fields, arrow.Field{
 				Name: col.Name,
-				Type: arrow.BinaryTypes.String, // Simplified
+				Type: arrow.BinaryTypes.String,
 			})
 		}
 	}
 
 	// Add CDC metadata columns
 	fields = append(fields, []arrow.Field{
-		{Name: "_pg_flo_operation", Type: arrow.BinaryTypes.String},           // INSERT/UPDATE/DELETE
-		{Name: "_pg_flo_lsn", Type: arrow.BinaryTypes.String},                 // WAL LSN
-		{Name: "_pg_flo_timestamp", Type: arrow.FixedWidthTypes.Timestamp_ms}, // Commit timestamp
-		{Name: "_pg_flo_schema", Type: arrow.BinaryTypes.String},              // Schema name
-		{Name: "_pg_flo_table", Type: arrow.BinaryTypes.String},               // Table name
+		{Name: "_pg_flo_operation", Type: arrow.BinaryTypes.String},
+		{Name: "_pg_flo_lsn", Type: arrow.BinaryTypes.String},
+		{Name: "_pg_flo_timestamp", Type: arrow.FixedWidthTypes.Timestamp_ms},
+		{Name: "_pg_flo_schema", Type: arrow.BinaryTypes.String},
+		{Name: "_pg_flo_table", Type: arrow.BinaryTypes.String},
 	}...)
 
 	// Add old value columns for UPDATE/DELETE
@@ -245,13 +247,16 @@ func (w *CDCParquetWriter) createCDCRecordBatch(schema *arrow.Schema, op *utils.
 		case "_pg_flo_lsn":
 			arrays = append(arrays, w.buildStringArray(pool, []string{op.LSN}))
 		case "_pg_flo_timestamp":
-			arrays = append(arrays, w.buildTimestampArray(pool, []time.Time{op.EmittedAt}))
+			if tsType, ok := field.Type.(*arrow.TimestampType); ok {
+				arrays = append(arrays, w.buildTimestampArray(pool, tsType, []time.Time{op.EmittedAt}))
+			} else {
+				arrays = append(arrays, w.buildTimestampArray(pool, &arrow.TimestampType{Unit: arrow.Millisecond}, []time.Time{op.EmittedAt}))
+			}
 		case "_pg_flo_schema":
 			arrays = append(arrays, w.buildStringArray(pool, []string{op.Schema}))
 		case "_pg_flo_table":
 			arrays = append(arrays, w.buildStringArray(pool, []string{op.Table}))
 		default:
-			// Handle table columns and old value columns
 			arrays = append(arrays, w.buildColumnArray(pool, field.Name, op))
 		}
 	}
@@ -272,8 +277,8 @@ func (w *CDCParquetWriter) buildStringArray(pool memory.Allocator, values []stri
 }
 
 // buildTimestampArray builds a timestamp array
-func (w *CDCParquetWriter) buildTimestampArray(pool memory.Allocator, values []time.Time) arrow.Array {
-	builder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Millisecond})
+func (w *CDCParquetWriter) buildTimestampArray(pool memory.Allocator, tsType *arrow.TimestampType, values []time.Time) arrow.Array {
+	builder := array.NewTimestampBuilder(pool, tsType)
 	defer builder.Release()
 
 	for _, val := range values {
@@ -288,7 +293,6 @@ func (w *CDCParquetWriter) buildColumnArray(pool memory.Allocator, fieldName str
 	builder := array.NewStringBuilder(pool)
 	defer builder.Release()
 
-	// Handle old value columns
 	if len(fieldName) > 5 && fieldName[:5] == "_old_" {
 		columnName := fieldName[5:]
 		value := w.getColumnValue(columnName, op.OldTuple, op.Columns)
@@ -300,7 +304,6 @@ func (w *CDCParquetWriter) buildColumnArray(pool memory.Allocator, fieldName str
 		return builder.NewStringArray()
 	}
 
-	// Handle regular table columns
 	value := w.getColumnValue(fieldName, op.NewTuple, op.Columns)
 	if value != nil {
 		builder.AppendString(string(value))
@@ -353,9 +356,8 @@ func (w *CDCParquetWriter) estimateTransactionSize(operations []*utils.CDCMessag
 
 // estimateOperationSize estimates the size of an operation
 func (w *CDCParquetWriter) estimateOperationSize(op *utils.CDCMessage) int64 {
-	size := int64(200) // Base overhead for CDC metadata
+	size := int64(200)
 
-	// Add table data size
 	if op.NewTuple != nil {
 		for _, col := range op.NewTuple.Columns {
 			if col != nil {
@@ -364,7 +366,6 @@ func (w *CDCParquetWriter) estimateOperationSize(op *utils.CDCMessage) int64 {
 		}
 	}
 
-	// Add old tuple size for UPDATE/DELETE
 	if op.OldTuple != nil {
 		for _, col := range op.OldTuple.Columns {
 			if col != nil {
@@ -379,17 +380,20 @@ func (w *CDCParquetWriter) estimateOperationSize(op *utils.CDCMessage) int64 {
 // close closes the table writer
 func (tw *tableWriter) close() error {
 	if tw.currentWriter != nil {
-		if err := tw.currentWriter.Close(); err != nil {
-			return err
-		}
+		_ = tw.currentWriter.Close()
 		tw.currentWriter = nil
 	}
 
+	var currentPath string
 	if tw.currentFile != nil {
-		if err := tw.currentFile.Close(); err != nil {
-			return err
-		}
+		currentPath = tw.currentFile.Name()
+		_ = tw.currentFile.Close()
 		tw.currentFile = nil
+	}
+
+	if currentPath != "" && strings.HasSuffix(currentPath, ".inprogress") {
+		finalPath := strings.TrimSuffix(currentPath, ".inprogress")
+		_ = os.Rename(currentPath, finalPath)
 	}
 
 	return nil

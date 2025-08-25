@@ -392,7 +392,7 @@ validate_parquet_files() {
   local files_found=false
 
   # Check each parquet file
-  for file in "$DIRECT_PARQUET_DIR"/*.parquet; do
+  for file in $(find "$DIRECT_PARQUET_DIR" -name "*.parquet"); do
     if [ -f "$file" ]; then
       files_found=true
       log "Validating file: $(basename "$file")"
