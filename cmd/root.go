@@ -602,12 +602,12 @@ func runDirectReplicator(_ *cobra.Command, _ []string) {
 		directConfig.S3.LocalPath = "/tmp/pg_flo_parquet"
 	}
 
-	// Create direct replicator
-	logger := utils.NewZerologLogger(log.With().Str("component", "direct-replicator").Logger())
+	// Create orchestrated direct replicator
+	logger := utils.NewZerologLogger(log.With().Str("component", "orchestrated-direct-replicator").Logger())
 
-	directReplicator, err := direct.NewDefaultDirectReplicator(directConfig, logger)
+	directReplicator, err := direct.NewOrchestratedDirectReplicator(directConfig, logger)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create direct replicator")
+		log.Fatal().Err(err).Msg("Failed to create orchestrated direct replicator")
 	}
 
 	// Create base context for the entire application

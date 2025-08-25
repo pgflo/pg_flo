@@ -40,6 +40,13 @@ type MetadataStore interface {
 	// S3 file tracking
 	RecordS3File(ctx context.Context, filePath string, txID string, tableNames []string) error
 	MarkS3FileProcessed(ctx context.Context, filePath string) error
+
+	// CTID-based copy progress tracking
+	SaveCopySnapshot(ctx context.Context, groupName, snapshotName, snapshotLSN string) error
+	GetCopySnapshot(ctx context.Context, groupName string) (string, string, error)
+	SaveCTIDCopyProgress(ctx context.Context, groupName, tableName, lastCTID string, bytesWritten int64, fileCount int, status string) error
+	GetCTIDCopyProgress(ctx context.Context, groupName, tableName string) (string, int64, int, string, error)
+	MarkCopyCompleted(ctx context.Context, groupName string) error
 }
 
 // TransactionStore defines the interface for transaction buffering and spilling

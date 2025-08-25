@@ -23,7 +23,7 @@ func NewDirectReplicatorFactory(config Config) *DirectReplicatorFactory {
 
 // CreateReplicator creates a new DirectReplicator instance
 func (f *DirectReplicatorFactory) CreateReplicator(replicatorConfig replicator.Config, _ replicator.NATSClient) (replicator.Replicator, error) {
-	logger := utils.NewZerologLogger(log.With().Str("component", "direct-replicator").Logger())
+	logger := utils.NewZerologLogger(log.With().Str("component", "orchestrated-direct-replicator").Logger())
 
 	// Convert replicator config to direct config
 	directConfig := f.Config
@@ -46,8 +46,8 @@ func (f *DirectReplicatorFactory) CreateReplicator(replicatorConfig replicator.C
 		directConfig.Group = replicatorConfig.Group
 	}
 
-	// Create direct replicator
-	dr, err := NewDefaultDirectReplicator(directConfig, logger)
+	// Create orchestrated direct replicator
+	dr, err := NewOrchestratedDirectReplicator(directConfig, logger)
 	if err != nil {
 		return nil, err
 	}

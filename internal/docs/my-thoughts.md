@@ -21,6 +21,8 @@ Ensure all tests pass with 'make test' and 'make lint' without errors
 - no double encoding/decoding
   -is commit lock even working? are we spilling to disk?
 - is consolidation even working?
+- no need for conslidation in copy
+- what about include/exclude column
 
 Update metadata store schema to match design doc and actual code requirements
 

@@ -83,6 +83,15 @@ type Config struct {
 
 	// Parquet configuration
 	MaxParquetFileSize int64 `yaml:"max_parquet_file_size"`
+
+	// PgFlo metadata configuration - adds _pg_flo_* columns to output
+	IncludePgFloMetadata bool `yaml:"include_pgflo_metadata"`
+
+	// Copy phase configuration
+	Copy CopyConfig `yaml:"copy"`
+
+	// Stream phase configuration
+	Stream StreamConfig `yaml:"stream"`
 }
 
 // DatabaseConfig represents database connection configuration
@@ -112,6 +121,16 @@ type TableConfig struct {
 	SyncMode       string   `yaml:"sync_mode"` // "copy-and-stream" or "stream"
 	IncludeColumns []string `yaml:"include_columns"`
 	ExcludeColumns []string `yaml:"exclude_columns"`
+}
+
+// CopyConfig represents configuration for the copy phase
+type CopyConfig struct {
+	ChunkSize int `yaml:"chunk_size"` // Rows per CTID chunk (default: 2000)
+}
+
+// StreamConfig represents configuration for the stream phase
+type StreamConfig struct {
+	RotationStrategy string `yaml:"rotation_strategy"` // "size" or "transaction" (default: "size")
 }
 
 // ConnectionString generates a PostgreSQL connection string

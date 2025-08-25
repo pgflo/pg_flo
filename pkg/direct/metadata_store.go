@@ -76,6 +76,7 @@ func (ms *PostgresMetadataStore) EnsureSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS pgflo_metadata.replication_state (
 			group_name TEXT PRIMARY KEY,
 			last_lsn TEXT NOT NULL DEFAULT '0/0',
+			copy_completed BOOLEAN DEFAULT FALSE,
 			updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 		)`,
 
@@ -95,6 +96,28 @@ func (ms *PostgresMetadataStore) EnsureSchema(ctx context.Context) error {
 			table_names TEXT[] NOT NULL,
 			processed_at TIMESTAMP WITH TIME ZONE,
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS pgflo_metadata.copy_progress (
+			group_name VARCHAR(255) NOT NULL,
+			table_name VARCHAR(255) NOT NULL,
+			last_ctid VARCHAR(50),
+			bytes_written BIGINT DEFAULT 0,
+			file_count INTEGER DEFAULT 0,
+			status VARCHAR(20) DEFAULT 'NOT_STARTED',
+			snapshot_name VARCHAR(255),
+			started_at TIMESTAMP WITH TIME ZONE,
+			completed_at TIMESTAMP WITH TIME ZONE,
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+			PRIMARY KEY (group_name, table_name)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS pgflo_metadata.copy_snapshots (
+			group_name VARCHAR(255) NOT NULL PRIMARY KEY,
+			snapshot_name VARCHAR(255) NOT NULL,
+			snapshot_lsn TEXT NOT NULL,
+			exported_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+			handoff_completed BOOLEAN DEFAULT FALSE
 		)`,
 	}
 
@@ -345,6 +368,115 @@ func (ms *PostgresMetadataStore) UpdateStreamingLSN(ctx context.Context, groupNa
 
 	if err != nil {
 		return fmt.Errorf("failed to update streaming LSN for group %s: %w", groupName, err)
+	}
+
+	return nil
+}
+
+// SaveCopySnapshot saves snapshot information for copy phase
+func (ms *PostgresMetadataStore) SaveCopySnapshot(ctx context.Context, groupName, snapshotName, snapshotLSN string) error {
+	_, err := ms.pool.Exec(ctx, `
+		INSERT INTO pgflo_metadata.copy_snapshots (group_name, snapshot_name, snapshot_lsn)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (group_name) DO UPDATE SET
+			snapshot_name = EXCLUDED.snapshot_name,
+			snapshot_lsn = EXCLUDED.snapshot_lsn,
+			exported_at = NOW(),
+			handoff_completed = FALSE`,
+		groupName, snapshotName, snapshotLSN)
+
+	if err != nil {
+		return fmt.Errorf("failed to save copy snapshot: %w", err)
+	}
+	return nil
+}
+
+// GetCopySnapshot retrieves snapshot information for copy phase
+func (ms *PostgresMetadataStore) GetCopySnapshot(ctx context.Context, groupName string) (string, string, error) {
+	var snapshotName, snapshotLSN string
+	err := ms.pool.QueryRow(ctx, `
+		SELECT snapshot_name, snapshot_lsn FROM pgflo_metadata.copy_snapshots
+		WHERE group_name = $1`,
+		groupName).Scan(&snapshotName, &snapshotLSN)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("failed to get copy snapshot: %w", err)
+	}
+	return snapshotName, snapshotLSN, nil
+}
+
+// SaveCTIDCopyProgress saves CTID-based copy progress for a table
+func (ms *PostgresMetadataStore) SaveCTIDCopyProgress(ctx context.Context, groupName, tableName, lastCTID string, bytesWritten int64, fileCount int, status string) error {
+	_, err := ms.pool.Exec(ctx, `
+		INSERT INTO pgflo_metadata.copy_progress
+		(group_name, table_name, last_ctid, bytes_written, file_count, status, started_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+		ON CONFLICT (group_name, table_name) DO UPDATE SET
+			last_ctid = EXCLUDED.last_ctid,
+			bytes_written = EXCLUDED.bytes_written,
+			file_count = EXCLUDED.file_count,
+			status = EXCLUDED.status,
+			completed_at = CASE WHEN EXCLUDED.status = 'COMPLETED' THEN NOW() ELSE copy_progress.completed_at END,
+			updated_at = NOW()`,
+		groupName, tableName, lastCTID, bytesWritten, fileCount, status)
+
+	if err != nil {
+		return fmt.Errorf("failed to save copy progress: %w", err)
+	}
+	return nil
+}
+
+// GetCTIDCopyProgress retrieves CTID-based copy progress for a table
+func (ms *PostgresMetadataStore) GetCTIDCopyProgress(ctx context.Context, groupName, tableName string) (string, int64, int, string, error) {
+	var lastCTID sql.NullString
+	var bytesWritten int64
+	var fileCount int
+	var status string
+
+	err := ms.pool.QueryRow(ctx, `
+		SELECT last_ctid, bytes_written, file_count, status
+		FROM pgflo_metadata.copy_progress
+		WHERE group_name = $1 AND table_name = $2`,
+		groupName, tableName).Scan(&lastCTID, &bytesWritten, &fileCount, &status)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", 0, 0, "NOT_STARTED", nil
+		}
+		return "", 0, 0, "", fmt.Errorf("failed to get copy progress: %w", err)
+	}
+
+	ctidStr := ""
+	if lastCTID.Valid {
+		ctidStr = lastCTID.String
+	}
+
+	return ctidStr, bytesWritten, fileCount, status, nil
+}
+
+// MarkCopyCompleted marks copy as completed for handoff to streaming
+func (ms *PostgresMetadataStore) MarkCopyCompleted(ctx context.Context, groupName string) error {
+	_, err := ms.pool.Exec(ctx, `
+		UPDATE pgflo_metadata.replication_state
+		SET copy_completed = TRUE, updated_at = NOW()
+		WHERE group_name = $1`,
+		groupName)
+
+	if err != nil {
+		return fmt.Errorf("failed to mark copy completed: %w", err)
+	}
+
+	_, err = ms.pool.Exec(ctx, `
+		UPDATE pgflo_metadata.copy_snapshots
+		SET handoff_completed = TRUE
+		WHERE group_name = $1`,
+		groupName)
+
+	if err != nil {
+		return fmt.Errorf("failed to mark snapshot handoff completed: %w", err)
 	}
 
 	return nil

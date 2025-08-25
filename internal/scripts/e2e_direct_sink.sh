@@ -53,6 +53,7 @@ max_tables_per_worker: 5
 max_workers_per_server: 10
 max_memory_bytes: 134217728
 max_parquet_file_size: 134217728
+include_pgflo_metadata: true
 EOF
   success "Direct sink configuration created"
 }
@@ -317,16 +318,35 @@ test_consolidation_effectiveness() {
 }
 
 verify_parquet_files() {
-  log "Verifying parquet files..."
+  log "Verifying parquet files with copy/stream separation..."
 
-  local parquet_count=$(find "$DIRECT_PARQUET_DIR" -name "*.parquet" | wc -l || echo "0")
-  log "Total parquet files created: $parquet_count"
+  # Check for copy and stream directories
+  local copy_dir="$DIRECT_PARQUET_DIR/copy"
+  local stream_dir="$DIRECT_PARQUET_DIR/stream"
 
-  if [ "$parquet_count" -eq 0 ]; then
+  local copy_files=$(find "$copy_dir" -name "*.parquet" 2>/dev/null | wc -l || echo "0")
+  local stream_files=$(find "$stream_dir" -name "*.parquet" 2>/dev/null | wc -l || echo "0")
+  local total_files=$((copy_files + stream_files))
+
+  log "Copy files: $copy_files, Stream files: $stream_files, Total: $total_files"
+
+  if [ "$total_files" -eq 0 ]; then
     error "No parquet files found"
     return 1
   fi
 
+  # Verify separation exists
+  if [ "$copy_files" -gt 0 ] && [ "$stream_files" -gt 0 ]; then
+    success "Copy/stream file separation verified"
+  else
+    warn "Copy/stream separation not found - checking for files in root directory"
+    local root_files=$(find "$DIRECT_PARQUET_DIR" -maxdepth 1 -name "*.parquet" | wc -l || echo "0")
+    if [ "$root_files" -gt 0 ]; then
+      log "Found $root_files files in root directory (legacy format)"
+    fi
+  fi
+
+  # Validate file structure
   if command -v parquet-tools >/dev/null; then
     log "Validating parquet file structure..."
     local sample_file=$(find "$DIRECT_PARQUET_DIR" -name "*.parquet" | head -1)
@@ -377,23 +397,16 @@ validate_parquet_files() {
       files_found=true
       log "Validating file: $(basename "$file")"
 
-      # Check if it's actually JSON (our current placeholder)
-      if head -1 "$file" | grep -q "^{"; then
-        log "⚠️  File contains JSON data (placeholder format)"
-        log "First few lines of $file:"
-        head -3 "$file" | sed 's/^/    /'
-      else
-        # Try to validate as actual parquet
-        if command -v parquet-tools >/dev/null 2>&1; then
-          if parquet-tools schema "$file" >/dev/null 2>&1; then
-            log "✅ Valid parquet file: $(basename "$file")"
-            parquet-tools schema "$file"
-          else
-            warn "⚠️  parquet-tools could not read file as parquet format"
-          fi
+      # Validate as binary parquet file
+      if command -v parquet-tools >/dev/null 2>&1; then
+        if parquet-tools inspect "$file" >/dev/null 2>&1; then
+          local row_count=$(parquet-tools inspect "$file" 2>/dev/null | grep "num_rows:" | head -1 | awk '{print $2}' || echo "0")
+          log "✅ Valid parquet file: $(basename "$file") ($row_count rows)"
         else
-          log "Note: parquet-tools not available for validation"
+          warn "⚠️  Could not validate parquet file: $(basename "$file")"
         fi
+      else
+        log "Note: parquet-tools not available for validation"
       fi
     fi
   done
@@ -526,13 +539,13 @@ validate_parquet_data_content() {
       local filename=$(basename "$file")
       log "📋 Validating parquet file: $filename"
 
-      # First, validate file structure and get row count using parquet-tools row-count
+      # First, validate file structure and get row count using parquet-tools inspect
       log "  🔍 Validating parquet file structure and row count..."
-      if parquet-tools schema "$file" >/dev/null 2>&1; then
+      if parquet-tools inspect "$file" >/dev/null 2>&1; then
         log "  ✅ Valid parquet schema"
 
-        # Get actual row count using parquet-tools row-count (always works)
-        local row_count=$(parquet-tools row-count "$file" 2>/dev/null || echo "0")
+        # Get actual row count from inspect output
+        local row_count=$(parquet-tools inspect "$file" 2>/dev/null | grep "num_rows:" | head -1 | awk '{print $2}' || echo "0")
         log "  📊 Rows: $row_count"
 
         # Count by table type
@@ -544,34 +557,60 @@ validate_parquet_data_content() {
           transactions_files=$((transactions_files + 1))
         fi
 
-        # Try to extract data using parquet-tools cat for detailed validation
-        local cat_output="$validation_dir/${filename%.parquet}_data.txt"
-        log "  🔍 Attempting detailed data validation with parquet-tools cat..."
-        if parquet-tools cat "$file" > "$cat_output" 2>/dev/null; then
-          log "  ✅ parquet-tools cat successful - detailed validation possible"
+        # Use parquet-tools inspect for detailed schema validation
+        log "  🔍 Validating parquet schema and metadata with parquet-tools inspect..."
+        local inspect_output="$validation_dir/${filename%.parquet}_inspect.txt"
+        if parquet-tools inspect "$file" > "$inspect_output" 2>/dev/null; then
+          log "  ✅ parquet-tools inspect successful"
 
-          # Validate CDC metadata presence
-          if grep -q "_pg_flo_operation" "$cat_output"; then
-            log "  ✅ CDC metadata fields present"
+          # Validate PgFlo metadata columns are present in schema
+          local pgflo_columns_found=0
+          if grep -q "_pg_flo_operation" "$inspect_output"; then ((pgflo_columns_found++)); fi
+          if grep -q "_pg_flo_lsn" "$inspect_output"; then ((pgflo_columns_found++)); fi
+          if grep -q "_pg_flo_timestamp" "$inspect_output"; then ((pgflo_columns_found++)); fi
+          if grep -q "_pg_flo_schema" "$inspect_output"; then ((pgflo_columns_found++)); fi
+          if grep -q "_pg_flo_table" "$inspect_output"; then ((pgflo_columns_found++)); fi
+
+          if [[ $pgflo_columns_found -eq 5 ]]; then
+            log "  ✅ All PgFlo metadata columns present in schema"
           else
-            warn "  ⚠️  CDC metadata not found in cat output"
+            warn "  ⚠️  Missing PgFlo metadata columns (found $pgflo_columns_found/5)"
           fi
 
-          # Check for proper CDC operation types
-          local insert_ops=$(grep -c '"INSERT"' "$cat_output" 2>/dev/null || echo "0")
-          local update_ops=$(grep -c '"UPDATE"' "$cat_output" 2>/dev/null || echo "0")
-          local delete_ops=$(grep -c '"DELETE"' "$cat_output" 2>/dev/null || echo "0")
-          log "  📈 Operations: INSERT=$insert_ops, UPDATE=$update_ops, DELETE=$delete_ops"
+          # Validate proper type mapping
+          if grep -q "logical_type: Decimal" "$inspect_output"; then
+            log "  ✅ Decimal types properly mapped"
+          fi
+          if grep -q "logical_type: Timestamp" "$inspect_output"; then
+            log "  ✅ Timestamp types properly mapped"
+          fi
+          if grep -q "logical_type: String" "$inspect_output"; then
+            log "  ✅ String types properly mapped"
+          fi
+        else
+          warn "  ⚠️  parquet-tools inspect failed"
+        fi
+
+        # Use parquet-tools show for data validation (more reliable than cat)
+        log "  🔍 Sampling data with parquet-tools show..."
+        local show_output="$validation_dir/${filename%.parquet}_data.txt"
+        if parquet-tools show "$file" --head 10 > "$show_output" 2>/dev/null; then
+          log "  ✅ parquet-tools show successful - data sampling complete"
+
+          local insert_ops=$(grep -c "INSERT" "$show_output" 2>/dev/null || echo "0")
+          local update_ops=$(grep -c "UPDATE" "$show_output" 2>/dev/null || echo "0")
+          local delete_ops=$(grep -c "DELETE" "$show_output" 2>/dev/null || echo "0")
+          log "  📈 Operations sampled: INSERT=$insert_ops, UPDATE=$update_ops, DELETE=$delete_ops"
 
           # Validate data integrity samples
           if [[ "$filename" == *"users"* ]]; then
-            validate_users_parquet_data "$cat_output" "$filename"
+            validate_users_parquet_data "$show_output" "$filename"
           elif [[ "$filename" == *"transactions"* ]]; then
-            validate_transactions_parquet_data "$cat_output" "$filename"
+            validate_transactions_parquet_data "$show_output" "$filename"
           fi
         else
-          warn "  ⚠️  parquet-tools cat failed for $filename - but row count validation passed"
-          log "  📊 File contains $row_count rows - CDC data is being written correctly"
+          warn "  ⚠️  parquet-tools show failed - skipping data sampling"
+          log "  ℹ️  Schema and row count validation still successful ($row_count rows)"
         fi
       else
         error "  ❌ Invalid parquet schema for $filename"
@@ -615,21 +654,38 @@ validate_users_parquet_data() {
   local data_file="$1"
   local filename="$2"
 
-  # Check for expected user data patterns
-  if grep -q '"text_col"' "$data_file" && grep -q '"json_col"' "$data_file"; then
+  # Validate column presence
+  if grep -q "text_col" "$data_file" && grep -q "json_col" "$data_file"; then
     log "  ✅ User table structure validated in $filename"
   else
     warn "  ⚠️  Unexpected user table structure in $filename"
   fi
 
-  # Check for array and complex data types
-  if grep -q '"array_text_col"' "$data_file" && grep -q '"array_int_col"' "$data_file"; then
-    log "  ✅ Array columns present in $filename"
+  # Validate complex data types with actual content
+  if grep -q '\[.*tag.*\]' "$data_file"; then
+    log "  ✅ Array data validated: contains array values"
+  else
+    warn "  ⚠️  Array data validation failed"
   fi
 
-  # Check for JSONB data
-  if grep -q '"user_id"' "$data_file" && grep -q '"level"' "$data_file"; then
-    log "  ✅ JSONB data validated in $filename"
+  if grep -q '"level".*"bronze"' "$data_file" && grep -q '"metadata"' "$data_file"; then
+    log "  ✅ JSON data validated: proper nested JSON structure"
+  else
+    warn "  ⚠️  JSON data validation failed"
+  fi
+
+  # Validate numeric precision
+  if grep -q '[0-9]\+\.[0-9]\+' "$data_file"; then
+    log "  ✅ Numeric data validated: contains decimal values"
+  else
+    warn "  ⚠️  Numeric data validation failed"
+  fi
+
+  # Validate timestamp format
+  if grep -q '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}.*[0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}' "$data_file"; then
+    log "  ✅ Timestamp data validated: proper ISO format"
+  else
+    warn "  ⚠️  Timestamp data validation failed"
   fi
 }
 
@@ -637,16 +693,32 @@ validate_transactions_parquet_data() {
   local data_file="$1"
   local filename="$2"
 
-  # Check for expected transaction data patterns
-  if grep -q '"amount"' "$data_file" && grep -q '"description"' "$data_file"; then
+  # Validate basic structure
+  if grep -q "amount" "$data_file" && grep -q "description" "$data_file"; then
     log "  ✅ Transaction table structure validated in $filename"
   else
     warn "  ⚠️  Unexpected transaction table structure in $filename"
   fi
 
-  # Check for metadata and tags
-  if grep -q '"metadata"' "$data_file" && grep -q '"tags"' "$data_file"; then
-    log "  ✅ Metadata and tags present in $filename"
+  # Validate decimal amounts (numeric precision)
+  if grep -q '[0-9]\+\.[0-9]\{2\}' "$data_file"; then
+    log "  ✅ Transaction amounts validated: proper decimal precision"
+  else
+    warn "  ⚠️  Transaction amount validation failed"
+  fi
+
+  # Validate JSON metadata structure
+  if grep -q '"source".*"batch_id"' "$data_file" && grep -q '"transaction_type"' "$data_file"; then
+    log "  ✅ Transaction metadata validated: proper JSON structure"
+  else
+    warn "  ⚠️  Transaction metadata validation failed"
+  fi
+
+  # Validate array tags
+  if grep -q '\[.*batch.*\]' "$data_file"; then
+    log "  ✅ Transaction tags validated: contains array values"
+  else
+    warn "  ⚠️  Transaction tags validation failed"
   fi
 }
 

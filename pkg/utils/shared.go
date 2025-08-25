@@ -6,7 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jackc/pgtype"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // ParseTimestamp attempts to parse a timestamp string using multiple layouts
@@ -89,6 +90,54 @@ func StringToOID(typeName string) uint32 {
 	return 0
 }
 
+// ToFloat64 converts an interface{} to float64
+func ToFloat64(v interface{}) (float64, bool) {
+	switch val := v.(type) {
+	case float64:
+		return val, true
+	case float32:
+		return float64(val), true
+	case int:
+		return float64(val), true
+	case int8:
+		return float64(val), true
+	case int16:
+		return float64(val), true
+	case int32:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case uint:
+		return float64(val), true
+	case uint8:
+		return float64(val), true
+	case uint16:
+		return float64(val), true
+	case uint32:
+		return float64(val), true
+	case uint64:
+		return float64(val), true
+	default:
+		return 0, false
+	}
+}
+
+// ToString converts an interface{} to string
+func ToString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// ToTimestamp converts interface{} to Arrow timestamp (microseconds since epoch)
+func ToTimestamp(v interface{}) (arrow.Timestamp, bool) {
+	if t, ok := v.(time.Time); ok {
+		return arrow.Timestamp(t.UnixMicro()), true
+	}
+	return 0, false
+}
+
 // ToInt64 converts an interface{} to int64
 func ToInt64(v interface{}) (int64, bool) {
 	switch v := v.(type) {
@@ -103,23 +152,6 @@ func ToInt64(v interface{}) (int64, bool) {
 	case string:
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return i, true
-		}
-	}
-	return 0, false
-}
-
-// ToFloat64 converts an interface{} to float64
-func ToFloat64(v interface{}) (float64, bool) {
-	switch v := v.(type) {
-	case int, int8, int16, int32, int64:
-		return float64(reflect.ValueOf(v).Int()), true
-	case uint, uint8, uint16, uint32, uint64:
-		return float64(reflect.ValueOf(v).Uint()), true
-	case float32, float64:
-		return reflect.ValueOf(v).Float(), true
-	case string:
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f, true
 		}
 	}
 	return 0, false
