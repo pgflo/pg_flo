@@ -557,7 +557,7 @@ func runDirectReplicator(_ *cobra.Command, _ []string) {
 	}
 
 	var directConfig direct.Config
-	configData, err := os.ReadFile(cfgFile)
+	configData, err := os.ReadFile(cfgFile) //nolint:gosec // Intentional file read
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to read direct sink config file")
 	}

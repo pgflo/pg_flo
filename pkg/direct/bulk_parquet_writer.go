@@ -104,7 +104,7 @@ func (w *BulkParquetWriter) rotateFile() error {
 
 	filePath := filepath.Join(w.basePath, fileName)
 
-	file, err := os.Create(filePath)
+	file, err := os.Create(filePath) //nolint:gosec // Intentional file creation
 	if err != nil {
 		return fmt.Errorf("failed to create copy file: %w", err)
 	}
@@ -208,27 +208,14 @@ func (w *BulkParquetWriter) createCopyRecordBatch(op *utils.CDCMessage) (arrow.R
 	return array.NewRecord(schema, arrays, 1), nil
 }
 
-// buildCopyArray builds Arrow array for copy data
-func (w *BulkParquetWriter) buildCopyArray(pool memory.Allocator, _ arrow.DataType, values [][]byte) arrow.Array {
-	// Simple string array for now - can be enhanced for specific types
-	builder := array.NewStringBuilder(pool)
-	defer builder.Release()
-
-	for _, val := range values {
-		if val == nil {
-			builder.AppendNull()
-		} else {
-			builder.AppendString(string(val))
-		}
-	}
-
-	return builder.NewStringArray()
+// buildCopyArray builds Arrow array for copy data with proper type conversion
+func (w *BulkParquetWriter) buildCopyArray(pool memory.Allocator, dataType arrow.DataType, values [][]byte) arrow.Array {
+	return utils.BuildArrowArrayFromPostgresData(pool, dataType, values)
 }
 
-// postgresTypeToArrow converts PostgreSQL types to Arrow types (simplified)
-func (w *BulkParquetWriter) postgresTypeToArrow(_ uint32) arrow.DataType {
-	// Simplified mapping - can be enhanced based on PostgreSQL OID types
-	return arrow.BinaryTypes.String
+// postgresTypeToArrow converts PostgreSQL types to Arrow types
+func (w *BulkParquetWriter) postgresTypeToArrow(pgTypeOID uint32) arrow.DataType {
+	return utils.PostgresTypeToArrowType(pgTypeOID)
 }
 
 // estimateOperationSize estimates the size of an operation for rotation

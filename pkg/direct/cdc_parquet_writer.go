@@ -148,7 +148,7 @@ func (w *CDCParquetWriter) openNewFileForTable(tw *tableWriter, sampleOp *utils.
 
 	filePath := filepath.Join(w.basePath, fileName)
 
-	file, err := os.Create(filePath)
+	file, err := os.Create(filePath) //nolint:gosec // Intentional file creation
 	if err != nil {
 		return fmt.Errorf("failed to create stream file: %w", err)
 	}

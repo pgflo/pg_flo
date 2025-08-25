@@ -4,11 +4,20 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pgflo/pg_flo/pkg/replicator"
 	"github.com/pgflo/pg_flo/pkg/utils"
+)
+
+const (
+	// CheckpointBatchSize defines how many commits to process before saving a checkpoint
+	CheckpointBatchSize = 100 // Update LSN every 100 commits
+	// CheckpointInterval defines the maximum time between checkpoints
+	CheckpointInterval = 5 * time.Second // Or every 5 seconds
 )
 
 // StreamReplicator handles WAL streaming with transaction boundaries
@@ -16,6 +25,7 @@ import (
 type StreamReplicator struct {
 	config           *Config
 	replicationConn  replicator.ReplicationConnection
+	standardConn     *pgx.Conn
 	transactionStore TransactionStore
 	consolidator     OperationConsolidator
 	cdcWriter        ParquetWriter // Will be CDCParquetWriter
@@ -28,6 +38,12 @@ type StreamReplicator struct {
 	commitLock   *pglogrepl.BeginMessage // Transaction boundary enforcement
 	currentTxLSN pglogrepl.LSN
 
+	// Batching state for anti-thrashing
+	commitCount      int64
+	currentBatchID   int64
+	lastCheckpoint   time.Time
+	lastProcessedLSN pglogrepl.LSN
+
 	// State management
 	stopChan chan struct{}
 	wg       sync.WaitGroup
@@ -38,6 +54,7 @@ type StreamReplicator struct {
 func NewStreamReplicator(
 	config *Config,
 	replicationConn replicator.ReplicationConnection,
+	standardConn *pgx.Conn,
 	transactionStore TransactionStore,
 	consolidator OperationConsolidator,
 	cdcWriter ParquetWriter,
@@ -47,6 +64,7 @@ func NewStreamReplicator(
 	return &StreamReplicator{
 		config:           config,
 		replicationConn:  replicationConn,
+		standardConn:     standardConn,
 		transactionStore: transactionStore,
 		consolidator:     consolidator,
 		cdcWriter:        cdcWriter,
@@ -54,6 +72,8 @@ func NewStreamReplicator(
 		logger:           logger,
 		relations:        make(map[uint32]*pglogrepl.RelationMessage),
 		stopChan:         make(chan struct{}),
+		lastCheckpoint:   time.Now(),
+		currentBatchID:   1,
 	}
 }
 
@@ -72,6 +92,11 @@ func (sr *StreamReplicator) StartFromLSN(ctx context.Context, startLSN pglogrepl
 		return fmt.Errorf("failed to connect to replication: %w", err)
 	}
 
+	// Create publication and replication slot if needed
+	if err := sr.createPublicationAndSlot(ctx); err != nil {
+		return fmt.Errorf("failed to create publication and slot: %w", err)
+	}
+
 	return sr.startReplicationFromLSN(ctx, startLSN)
 }
 
@@ -84,17 +109,36 @@ func (sr *StreamReplicator) Stop(ctx context.Context) error {
 		sr.logger.Error().Err(err).Msg("Failed to close CDC writer")
 	}
 
-	return sr.replicationConn.Close(ctx)
+	// Only close if replication connection was established
+	if sr.replicationConn != nil {
+		// Additional safety check to avoid nil pointer dereference
+		if err := func() error {
+			defer func() {
+				if r := recover(); r != nil {
+					sr.logger.Warn().Interface("panic", r).Msg("Recovered from panic while closing replication connection")
+				}
+			}()
+			return sr.replicationConn.Close(ctx)
+		}(); err != nil {
+			sr.logger.Warn().Err(err).Msg("Error closing replication connection")
+		}
+	}
+
+	return nil
 }
 
 // startReplicationFromLSN starts WAL streaming
 func (sr *StreamReplicator) startReplicationFromLSN(ctx context.Context, lsn pglogrepl.LSN) error {
 	slotName := fmt.Sprintf("pg_flo_%s", sr.config.Group)
+	publicationName := generatePublicationName(sr.config.Group)
 
 	opts := pglogrepl.StartReplicationOptions{
-		Timeline:   -1,
-		Mode:       pglogrepl.LogicalReplication,
-		PluginArgs: []string{},
+		Timeline: -1,
+		Mode:     pglogrepl.LogicalReplication,
+		PluginArgs: []string{
+			"proto_version '1'",
+			fmt.Sprintf("publication_names '%s'", publicationName),
+		},
 	}
 
 	if err := sr.replicationConn.StartReplication(ctx, slotName, lsn, opts); err != nil {
@@ -142,11 +186,49 @@ func (sr *StreamReplicator) receiveMessage(ctx context.Context) error {
 	}
 }
 
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // handleCopyData processes WAL copy data messages
 func (sr *StreamReplicator) handleCopyData(data []byte) error {
-	logicalMsg, err := pglogrepl.Parse(data)
+	// Check if this is a keepalive message first
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Handle primary keepalive messages
+	if data[0] == 'k' {
+		sr.logger.Debug().Msg("Received keepalive message")
+		return nil
+	}
+
+	// Handle WAL messages starting with 'w'
+	if data[0] != 'w' {
+		sr.logger.Debug().
+			Str("message_type", string(data[0])).
+			Msg("Received non-WAL message - ignored")
+		return nil
+	}
+
+	// Parse logical replication message (skip the 'w' prefix and WAL position)
+	if len(data) < 25 {
+		sr.logger.Debug().Msg("Received short WAL message - ignored")
+		return nil
+	}
+
+	logicalMsg, err := pglogrepl.Parse(data[25:]) // Skip WAL header
 	if err != nil {
-		return fmt.Errorf("failed to parse logical message: %w", err)
+		// Log the error but don't fail - some messages might not be supported
+		sr.logger.Debug().
+			Err(err).
+			Str("data_preview", fmt.Sprintf("%x", data[:min(len(data), 50)])).
+			Msg("Failed to parse logical message - ignoring")
+		return nil
 	}
 
 	switch msg := logicalMsg.(type) {
@@ -162,8 +244,23 @@ func (sr *StreamReplicator) handleCopyData(data []byte) error {
 		return sr.handleDeleteMessage(msg)
 	case *pglogrepl.RelationMessage:
 		return sr.handleRelationMessage(msg)
+	case *pglogrepl.TypeMessage:
+		// Type messages provide data type information - we can safely ignore these
+		sr.logger.Debug().Msg("Received type message - ignored")
+		return nil
+	case *pglogrepl.OriginMessage:
+		// Origin messages for replication origins - safe to ignore
+		sr.logger.Debug().Msg("Received origin message - ignored")
+		return nil
+	case *pglogrepl.TruncateMessage:
+		// Truncate operations - log but don't fail
+		sr.logger.Info().Msg("Received truncate message - ignored")
+		return nil
 	default:
-		// Other message types
+		// Log unknown message types but continue processing
+		sr.logger.Warn().
+			Str("message_type", fmt.Sprintf("%T", msg)).
+			Msg("Received unknown message type - ignored")
 		return nil
 	}
 }
@@ -202,7 +299,14 @@ func (sr *StreamReplicator) handleCommitMessage(msg *pglogrepl.CommitMessage) er
 
 	if len(allMessages) == 0 {
 		sr.commitLock = nil
-		return sr.saveStreamingState(msg.CommitLSN)
+		sr.lastProcessedLSN = msg.CommitLSN
+		sr.commitCount++
+
+		// Batched checkpoint for empty transactions too
+		if sr.shouldSaveCheckpoint() {
+			return sr.saveStreamingCheckpoint(msg.CommitLSN)
+		}
+		return nil
 	}
 
 	sr.logger.Info().
@@ -227,8 +331,14 @@ func (sr *StreamReplicator) handleCommitMessage(msg *pglogrepl.CommitMessage) er
 
 	// Update streaming state
 	sr.lastLSN = msg.CommitLSN
-	if err := sr.saveStreamingState(msg.CommitLSN); err != nil {
-		return fmt.Errorf("failed to save streaming state: %w", err)
+	sr.lastProcessedLSN = msg.CommitLSN
+	sr.commitCount++
+
+	// Batched checkpoint updates (anti-thrashing)
+	if sr.shouldSaveCheckpoint() {
+		if err := sr.saveStreamingCheckpoint(msg.CommitLSN); err != nil {
+			return fmt.Errorf("failed to save streaming checkpoint: %w", err)
+		}
 	}
 
 	// Clear transaction state
@@ -334,8 +444,108 @@ func (sr *StreamReplicator) extractPrimaryKey(msg *utils.CDCMessage) string {
 	return "unknown"
 }
 
-// saveStreamingState saves current LSN to metadata store
-func (sr *StreamReplicator) saveStreamingState(lsn pglogrepl.LSN) error {
+// shouldSaveCheckpoint determines if we should save a checkpoint based on batching rules
+func (sr *StreamReplicator) shouldSaveCheckpoint() bool {
+	return sr.commitCount%CheckpointBatchSize == 0 ||
+		time.Since(sr.lastCheckpoint) > CheckpointInterval
+}
+
+// saveStreamingCheckpoint saves LSN and batch ID with batching
+func (sr *StreamReplicator) saveStreamingCheckpoint(lsn pglogrepl.LSN) error {
 	ctx := context.Background()
-	return sr.metadataStore.UpdateStreamingLSN(ctx, sr.config.Group, lsn)
+
+	sr.currentBatchID++
+	sr.lastCheckpoint = time.Now()
+
+	err := sr.metadataStore.UpdateStreamingLSNWithBatch(ctx, sr.config.Group, lsn, sr.currentBatchID)
+	if err != nil {
+		return err
+	}
+
+	sr.logger.Info().
+		Str("lsn", lsn.String()).
+		Int64("batch_id", sr.currentBatchID).
+		Int64("commits_processed", sr.commitCount).
+		Msg("Checkpoint saved with batching")
+
+	return nil
+}
+
+// createPublicationAndSlot creates the PostgreSQL publication and replication slot
+func (sr *StreamReplicator) createPublicationAndSlot(ctx context.Context) error {
+	groupName := sr.config.Group
+
+	// Create publication first
+	if err := sr.createPublication(ctx, groupName); err != nil {
+		return fmt.Errorf("failed to create publication: %w", err)
+	}
+
+	// Create replication slot
+	if err := sr.createReplicationSlot(ctx, groupName); err != nil {
+		return fmt.Errorf("failed to create replication slot: %w", err)
+	}
+
+	return nil
+}
+
+// createPublication creates the PostgreSQL publication for the tables
+func (sr *StreamReplicator) createPublication(ctx context.Context, groupName string) error {
+	publicationName := generatePublicationName(groupName)
+
+	// Check if publication already exists
+	var exists bool
+	query := "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)"
+	if err := sr.standardConn.QueryRow(ctx, query, publicationName).Scan(&exists); err != nil {
+		return fmt.Errorf("failed to check publication existence: %w", err)
+	}
+
+	if exists {
+		sr.logger.Info().Str("publication", publicationName).Msg("Publication already exists")
+		return nil
+	}
+
+	// Create publication for all tables
+	createQuery := fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", publicationName)
+	if _, err := sr.standardConn.Exec(ctx, createQuery); err != nil {
+		return fmt.Errorf("failed to create publication: %w", err)
+	}
+
+	sr.logger.Info().Str("publication", publicationName).Msg("Publication created successfully")
+	return nil
+}
+
+// createReplicationSlot creates the replication slot if it doesn't exist
+func (sr *StreamReplicator) createReplicationSlot(ctx context.Context, groupName string) error {
+	slotName := generatePublicationName(groupName)
+
+	// Check if slot already exists
+	var exists bool
+	query := "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)"
+	if err := sr.standardConn.QueryRow(ctx, query, slotName).Scan(&exists); err != nil {
+		return fmt.Errorf("failed to check replication slot existence: %w", err)
+	}
+
+	if exists {
+		sr.logger.Info().Str("slot", slotName).Msg("Replication slot already exists")
+		return nil
+	}
+
+	// Create replication slot using the replication connection
+	result, err := sr.replicationConn.CreateReplicationSlot(ctx, slotName)
+	if err != nil {
+		return fmt.Errorf("failed to create replication slot: %w", err)
+	}
+
+	sr.logger.Info().
+		Str("slot", slotName).
+		Str("consistent_point", result.ConsistentPoint).
+		Str("snapshot_name", result.SnapshotName).
+		Msg("Replication slot created successfully")
+
+	return nil
+}
+
+// generatePublicationName generates a publication name from the group name
+func generatePublicationName(groupName string) string {
+	return fmt.Sprintf("pg_flo_%s", groupName)
 }

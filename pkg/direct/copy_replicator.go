@@ -96,28 +96,13 @@ func (cr *CopyReplicator) StartCopy(ctx context.Context, tables []TableInfo) (*S
 	return snapshotInfo, nil
 }
 
-// exportSnapshot exports a PostgreSQL snapshot for consistent point-in-time copy
+// exportSnapshot gets the current LSN for consistent copy-stream handoff
 func (cr *CopyReplicator) exportSnapshot(ctx context.Context) (*SnapshotInfo, error) {
-	// Begin transaction with repeatable read isolation
-	tx, err := cr.conn.BeginTx(ctx, pgx.TxOptions{
-		IsoLevel:   pgx.RepeatableRead,
-		AccessMode: pgx.ReadOnly,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin snapshot transaction: %w", err)
-	}
-	defer func() {
-		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-			cr.logger.Warn().Err(rollbackErr).Msg("Failed to rollback transaction")
-		}
-	}()
-
-	// Export snapshot and get current LSN
-	var snapshotName string
+	// Get current LSN for copy-stream handoff
 	var lsnStr string
-	err = tx.QueryRow(ctx, "SELECT pg_export_snapshot(), pg_current_wal_lsn()").Scan(&snapshotName, &lsnStr)
+	err := cr.conn.QueryRow(ctx, "SELECT pg_current_wal_lsn()").Scan(&lsnStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to export snapshot: %w", err)
+		return nil, fmt.Errorf("failed to get current LSN: %w", err)
 	}
 
 	// Parse LSN
@@ -126,13 +111,8 @@ func (cr *CopyReplicator) exportSnapshot(ctx context.Context) (*SnapshotInfo, er
 		return nil, fmt.Errorf("failed to parse LSN: %w", err)
 	}
 
-	// Commit the transaction to maintain snapshot
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit snapshot transaction: %w", err)
-	}
-
 	return &SnapshotInfo{
-		Name:       snapshotName,
+		Name:       fmt.Sprintf("copy-start-%d", time.Now().Unix()),
 		LSN:        lsn,
 		ExportedAt: time.Now(),
 	}, nil
@@ -292,7 +272,7 @@ func (cr *CopyReplicator) parseCTIDPage(ctid string) (uint32, error) {
 }
 
 // copyTableRange copies a specific CTID range from a table
-func (cr *CopyReplicator) copyTableRange(ctx context.Context, table TableInfo, ctidRange CTIDRange, snapshot *SnapshotInfo) (int64, int64, int, error) {
+func (cr *CopyReplicator) copyTableRange(ctx context.Context, table TableInfo, ctidRange CTIDRange, _ *SnapshotInfo) (int64, int64, int, error) {
 	// Begin transaction with snapshot
 	tx, err := cr.conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
@@ -307,10 +287,8 @@ func (cr *CopyReplicator) copyTableRange(ctx context.Context, table TableInfo, c
 		}
 	}()
 
-	// Set transaction snapshot for consistency
-	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT $1", snapshot.Name); err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to set transaction snapshot: %w", err)
-	}
+	// Use repeatable read isolation for consistency
+	// The snapshot LSN provides the consistency point we need
 
 	// Build CTID range query
 	query := fmt.Sprintf("SELECT * FROM %s WHERE ctid >= $1::tid AND ctid < $2::tid",

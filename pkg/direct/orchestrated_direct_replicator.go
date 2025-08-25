@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/pgflo/pg_flo/pkg/replicator"
 	"github.com/pgflo/pg_flo/pkg/utils"
@@ -106,7 +107,7 @@ func NewOrchestratedDirectReplicator(config Config, logger utils.Logger) (*Orche
 	copyReplicator := NewCopyReplicator(&config, standardConn, bulkWriter, metadataStore, logger)
 
 	// Create stream replicator
-	streamReplicator := NewStreamReplicator(&config, replicationConn, transactionStore, consolidator, cdcWriter, metadataStore, logger)
+	streamReplicator := NewStreamReplicator(&config, replicationConn, standardConn, transactionStore, consolidator, cdcWriter, metadataStore, logger)
 
 	return &OrchestratedDirectReplicator{
 		config:           config,
@@ -137,11 +138,8 @@ func (odr *OrchestratedDirectReplicator) Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure metadata schema: %w", err)
 	}
 
-	// Discover and register tables from config
+	// Discover tables from config (for logging/validation)
 	tables := odr.discoverTablesFromConfig()
-	if err := odr.metadataStore.RegisterTables(ctx, odr.config.Group, tables); err != nil {
-		return fmt.Errorf("failed to register tables: %w", err)
-	}
 
 	odr.logger.Info().
 		Int("tables_discovered", len(tables)).
@@ -184,6 +182,18 @@ func (odr *OrchestratedDirectReplicator) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to get last streaming LSN: %w", err)
 	}
 
+	// If LSN is 0, this is a fresh start - get current LSN from PostgreSQL
+	if lastLSN == 0 {
+		odr.logger.Info().Msg("No previous LSN found, getting current LSN from PostgreSQL")
+		// Get current LSN to start streaming from now
+		currentLSN, err := odr.getCurrentLSN(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get current LSN: %w", err)
+		}
+		lastLSN = currentLSN
+		odr.logger.Info().Str("current_lsn", lastLSN.String()).Msg("Starting from current LSN for fresh group")
+	}
+
 	odr.logger.Info().
 		Str("start_lsn", lastLSN.String()).
 		Msg("Starting stream-only mode from last LSN")
@@ -221,8 +231,19 @@ func (odr *OrchestratedDirectReplicator) Stop(ctx context.Context) error {
 		}
 	}
 
-	if err := odr.replicationConn.Close(ctx); err != nil {
-		odr.logger.Error().Err(err).Msg("Failed to close replication connection")
+	// Only close if replication connection was established
+	if odr.replicationConn != nil {
+		// Additional safety check to avoid nil pointer dereference
+		if err := func() error {
+			defer func() {
+				if r := recover(); r != nil {
+					odr.logger.Warn().Interface("panic", r).Msg("Recovered from panic while closing replication connection")
+				}
+			}()
+			return odr.replicationConn.Close(ctx)
+		}(); err != nil {
+			odr.logger.Warn().Err(err).Msg("Error closing replication connection")
+		}
 	}
 
 	// Close metadata store
@@ -238,13 +259,21 @@ func (odr *OrchestratedDirectReplicator) Stop(ctx context.Context) error {
 func (odr *OrchestratedDirectReplicator) discoverTablesFromConfig() []TableInfo {
 	var tables []TableInfo
 
+	odr.logger.Debug().Interface("schemas_config", odr.config.Schemas).Msg("Discovering tables from config")
+
 	for schemaName, schemaConfig := range odr.config.Schemas {
-		if schemaConfigMap, ok := schemaConfig.(map[string]interface{}); ok {
+		odr.logger.Debug().Str("schema", schemaName).Interface("config", schemaConfig).Msg("Processing schema")
+
+		// Convert map[interface{}]interface{} to map[string]interface{} if needed
+		schemaConfigMap := odr.convertToStringMap(schemaConfig)
+		if schemaConfigMap != nil {
 			if tablesConfig, exists := schemaConfigMap["tables"]; exists {
-				if tablesMap, ok := tablesConfig.(map[string]interface{}); ok {
+				tablesMap := odr.convertToStringMap(tablesConfig)
+				if tablesMap != nil {
 					for tableName, tableConfig := range tablesMap {
 						syncMode := "copy-and-stream" // Default
-						if tableConfigMap, ok := tableConfig.(map[string]interface{}); ok {
+						tableConfigMap := odr.convertToStringMap(tableConfig)
+						if tableConfigMap != nil {
 							if mode, exists := tableConfigMap["sync_mode"]; exists {
 								if modeStr, ok := mode.(string); ok {
 									syncMode = modeStr
@@ -257,12 +286,21 @@ func (odr *OrchestratedDirectReplicator) discoverTablesFromConfig() []TableInfo 
 							Table:    tableName,
 							SyncMode: syncMode,
 						})
+
+						odr.logger.Debug().Str("schema", schemaName).Str("table", tableName).Str("sync_mode", syncMode).Msg("Discovered table")
 					}
+				} else {
+					odr.logger.Warn().Str("schema", schemaName).Msg("tables config is not a map")
 				}
+			} else {
+				odr.logger.Warn().Str("schema", schemaName).Msg("no tables config found")
 			}
+		} else {
+			odr.logger.Warn().Str("schema", schemaName).Msg("schema config is not a map")
 		}
 	}
 
+	odr.logger.Info().Int("total_tables", len(tables)).Msg("Table discovery completed")
 	return tables
 }
 
@@ -278,4 +316,38 @@ func (odr *OrchestratedDirectReplicator) getTablesForCopyAndStream() []TableInfo
 	}
 
 	return copyStreamTables
+}
+
+// getCurrentLSN gets the current LSN from PostgreSQL
+func (odr *OrchestratedDirectReplicator) getCurrentLSN(ctx context.Context) (pglogrepl.LSN, error) {
+	var lsnStr string
+	err := odr.standardConn.QueryRow(ctx, "SELECT pg_current_wal_lsn()").Scan(&lsnStr)
+	if err != nil {
+		return pglogrepl.LSN(0), fmt.Errorf("failed to get current LSN: %w", err)
+	}
+
+	lsn, err := pglogrepl.ParseLSN(lsnStr)
+	if err != nil {
+		return pglogrepl.LSN(0), fmt.Errorf("failed to parse current LSN: %w", err)
+	}
+
+	return lsn, nil
+}
+
+// convertToStringMap converts map[interface{}]interface{} to map[string]interface{}
+func (odr *OrchestratedDirectReplicator) convertToStringMap(input interface{}) map[string]interface{} {
+	switch v := input.(type) {
+	case map[string]interface{}:
+		return v
+	case map[interface{}]interface{}:
+		result := make(map[string]interface{})
+		for key, value := range v {
+			if strKey, ok := key.(string); ok {
+				result[strKey] = value
+			}
+		}
+		return result
+	default:
+		return nil
+	}
 }

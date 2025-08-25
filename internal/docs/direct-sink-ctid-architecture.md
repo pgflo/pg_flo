@@ -130,21 +130,40 @@ func (dr *DirectReplicator) Execute() error {
 - **Copy**: Pure size-based rotation, no transaction logic, no CDC metadata
 - **Stream**: Size-based rotation BUT respects transaction boundaries, includes CDC metadata
 
-## Metadata Store Schema Changes
+## Metadata Store Schema - Consolidated Design
 
-### New Tables
+**Inspired by PeerDB's proven approach**: Minimal tables, batched updates, monotonic progress tracking
 
-#### `copy_progress`
+### Core Tables
+
+#### `replication_state` - Stream Progress Tracking
 
 ```sql
-CREATE TABLE pgflo_metadata.copy_progress (
+CREATE TABLE pgflo_metadata.replication_state (
+    group_name TEXT PRIMARY KEY,
+    last_lsn TEXT NOT NULL DEFAULT '0/0',
+    sync_batch_id BIGINT DEFAULT 0,      -- Batch completion tracking (PeerDB pattern)
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+```
+
+**Key Features:**
+
+- ✅ **Batched Updates**: LSN updated every N commits or time interval (not per transaction)
+- ✅ **Monotonic Progress**: Uses `GREATEST()` to prevent LSN regression
+- ✅ **Batch Tracking**: `sync_batch_id` tracks completion of parquet file batches
+
+#### `copy_state` - Consolidated Copy Progress
+
+```sql
+CREATE TABLE pgflo_metadata.copy_state (
     group_name      VARCHAR(255) NOT NULL,
     table_name      VARCHAR(255) NOT NULL,
-    last_ctid       VARCHAR(50),           -- "(150,32)"
-    bytes_written   BIGINT DEFAULT 0,
-    file_count      INTEGER DEFAULT 0,
-    status          VARCHAR(20) DEFAULT 'NOT_STARTED', -- NOT_STARTED, IN_PROGRESS, COMPLETED but can this be inffered by started_at?
-    snapshot_name   VARCHAR(255),
+    last_ctid       VARCHAR(50),           -- "(150,32)" - exact resumption point
+    bytes_written   BIGINT DEFAULT 0,      -- For file rotation tracking
+    file_count      INTEGER DEFAULT 0,     -- For naming: users_copy_001.parquet
+    status          VARCHAR(20) DEFAULT 'NOT_STARTED', -- NOT_STARTED, IN_PROGRESS, COMPLETED
+    snapshot_lsn    TEXT,                  -- Consolidated from copy_snapshots
     started_at      TIMESTAMP WITH TIME ZONE,
     completed_at    TIMESTAMP WITH TIME ZONE,
     updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -152,24 +171,139 @@ CREATE TABLE pgflo_metadata.copy_progress (
 );
 ```
 
-#### `copy_snapshots`
+**Consolidation Benefits:**
+
+- ❌ **Removed**: `copy_snapshots` (merged into `copy_state.snapshot_lsn`)
+- ❌ **Removed**: `copy_progress` (consolidated into `copy_state`)
+- ✅ **Simplified**: One table for all copy tracking per table
+- ✅ **Resumable**: CTID-based resumption with snapshot LSN for handoff
+
+#### `s3_files` - Future S3 → Redshift Pipeline
 
 ```sql
-CREATE TABLE pgflo_metadata.copy_snapshots (
-    group_name      VARCHAR(255) NOT NULL PRIMARY KEY,
-    snapshot_name   VARCHAR(255) NOT NULL,
-    snapshot_lsn    TEXT NOT NULL,
-    exported_at     TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    handoff_completed BOOLEAN DEFAULT FALSE
+CREATE TABLE pgflo_metadata.s3_files (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_path TEXT NOT NULL UNIQUE,
+    sync_batch_id BIGINT NOT NULL,       -- Links to replication_state.sync_batch_id
+    table_names TEXT[] NOT NULL,
+    file_size_bytes BIGINT,
+    row_count BIGINT,
+    processed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 ```
 
-#### Update `streaming_state`
+**Future Pipeline Support:**
 
-```sql
-ALTER TABLE pgflo_metadata.streaming_state
-ADD COLUMN copy_completed BOOLEAN DEFAULT FALSE;
+- ✅ **Batch Linking**: `sync_batch_id` links parquet files to replication batches
+- ✅ **Redshift Workers**: Track S3 files for downstream sync workers
+- ✅ **Processing State**: Mark files as processed after Redshift sync
+
+## Batching Strategy - Anti-Thrashing Design
+
+**Inspired by PeerDB's proven approach**: Avoid per-transaction metadata updates
+
+### Stream Phase Batching
+
+```go
+// Current (thrashing): Update LSN on every commit
+func (sr *StreamReplicator) handleCommitMessage(msg *pglogrepl.CommitMessage) error {
+    // Process transaction...
+    return sr.saveStreamingState(msg.CommitLSN) // ❌ Called 1000x/sec
+}
+
+// New (batched): Update LSN periodically
+const (
+    CHECKPOINT_BATCH_SIZE = 100          // Every 100 commits
+    CHECKPOINT_INTERVAL   = 5 * time.Second // Or every 5 seconds
+)
+
+func (sr *StreamReplicator) handleCommitMessage(msg *pglogrepl.CommitMessage) error {
+    // Process transaction...
+    sr.commitCount++
+    sr.lastProcessedLSN = msg.CommitLSN
+
+    // Batch checkpoint updates (PeerDB pattern)
+    if sr.commitCount%CHECKPOINT_BATCH_SIZE == 0 ||
+       time.Since(sr.lastCheckpoint) > CHECKPOINT_INTERVAL {
+        return sr.saveStreamingCheckpoint(msg.CommitLSN, sr.currentBatchID)
+    }
+    return nil
+}
 ```
+
+### Monotonic LSN Updates (PeerDB Pattern)
+
+```go
+func (ms *PostgresMetadataStore) UpdateStreamingLSN(ctx context.Context, groupName string, lsn pglogrepl.LSN, batchID int64) error {
+    _, err := ms.pool.Exec(ctx, `
+        INSERT INTO pgflo_metadata.replication_state (group_name, last_lsn, sync_batch_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (group_name) DO UPDATE SET
+            last_lsn = GREATEST(replication_state.last_lsn, excluded.last_lsn),  -- Prevent regression
+            sync_batch_id = GREATEST(replication_state.sync_batch_id, excluded.sync_batch_id),
+            updated_at = NOW()`,
+        groupName, lsn.String(), batchID)
+    return err
+}
+```
+
+### Parquet File → S3 → Redshift Pipeline
+
+```
+┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Direct Sink   │    │ Local Parquet│    │   S3 Storage    │    │   Redshift      │
+│                 │    │   Files      │    │                 │    │   Workers       │
+│                 │    │              │    │                 │    │                 │
+│ • Copy Phase    │───▶│ /copy/*.pqt  │───▶│ s3://bucket/    │───▶│ COPY FROM S3    │
+│ • Stream Phase  │    │ /stream/*.pqt│    │   copy/         │    │ • Batch loading │
+│ • Batch LSN     │    │              │    │   stream/       │    │ • State tracking│
+│   tracking      │    │              │    │                 │    │ • Error handling│
+└─────────────────┘    └──────────────┘    └─────────────────┘    └─────────────────┘
+                              │                       │                       │
+                              ▼                       ▼                       ▼
+                    sync_batch_id                sync_batch_id         sync_batch_id
+                    (in filename)                (in s3_files)        (completion tracking)
+```
+
+**Key Benefits:**
+
+- ✅ **Reduced Metadata I/O**: 100x fewer database writes (10/sec vs 1000/sec)
+- ✅ **Resumability**: Max 5-second data loss on restart (vs per-transaction)
+- ✅ **Batch Traceability**: Files linked to sync batches for Redshift workers
+- ✅ **Monotonic Progress**: Never regress LSN even with concurrent workers
+
+### Why Not Temporal? - Simple is Better
+
+**PeerDB uses Temporal for complex multi-destination CDC**. For Direct Sink's focused use case, we get PeerDB's proven patterns WITHOUT the complexity:
+
+```
+PeerDB (Complex):                    pg_flo Direct Sink (Focused):
+┌─────────────────────┐             ┌─────────────────────┐
+│ Temporal Workflows  │             │   Simple Go App     │
+│ • Multiple Workers  │             │ • Single Binary     │
+│ • Activity Retries  │             │ • Built-in Retries  │
+│ • State Machines    │             │ • PostgreSQL State  │
+│ • Distributed Sync  │             │ • Local→S3→Redshift │
+└─────────────────────┘             └─────────────────────┘
+         │                                    │
+         ▼                                    ▼
+┌─────────────────────┐             ┌─────────────────────┐
+│ Multiple Destinations│             │ Parquet → S3 Only  │
+│ • BigQuery         │             │ • Optimized Path    │
+│ • Snowflake        │             │ • Minimal Overhead  │
+│ • ClickHouse       │             │ • Direct Control    │
+│ • Postgres         │             │                     │
+└─────────────────────┘             └─────────────────────┘
+```
+
+**Direct Sink Advantages:**
+
+- ✅ **Simpler Operations**: No Temporal cluster to manage
+- ✅ **Lower Latency**: No workflow scheduling overhead
+- ✅ **Direct Control**: Custom retry/recovery logic
+- ✅ **Focused Design**: Optimized for Parquet→S3→Redshift pipeline
+- ✅ **Proven Patterns**: Adopts PeerDB's metadata batching without complexity
 
 ## Implementation Plan
 
@@ -211,13 +345,23 @@ copy:
   chunk_size: 2000 # Rows per CTID chunk
   # No transaction logic, consolidation, or commit locks - just bulk copy with size rotation
 
-# Stream phase configuration
+# Stream phase configuration (inspired by PeerDB batching)
 stream:
+  checkpoint_batch_size: 100 # Update LSN every N commits (anti-thrashing)
+  checkpoint_interval: "5s" # Or every 5 seconds (whichever comes first)
   # All built-in behavior:
   # - Size-based rotation (128MB) with transaction boundary awareness
   # - Commit lock pattern (data written only after COMMIT)
   # - Operation consolidation (key-based deduplication)
   # - Transaction store with disk spilling
+  # - Batched metadata updates (PeerDB pattern)
+
+# Metadata configuration
+metadata:
+  # Consolidated schema with minimal tables
+  # - replication_state: LSN + batch tracking
+  # - copy_state: Consolidated copy progress
+  # - s3_files: Future S3 → Redshift pipeline
 ```
 
 ## Testing Strategy
@@ -342,13 +486,13 @@ ls -la /tmp/pg_flo_direct_parquet/
 
 **📋 PENDING (Priority Order):**
 
-1. **BulkParquetWriter** - Copy phase writer (no CDC metadata)
-2. **StreamReplicator** - Clean WAL streaming implementation
-3. **CDCParquetWriter** - Stream phase writer (with CDC metadata)
-4. **DirectReplicator Refactor** - Orchestrate Copy → Stream transition
-5. **E2E Test Updates** - Validate copy/stream separation
-6. **Configuration Updates** - Add copy/stream config options
-7. **Unit Tests** - Comprehensive test coverage
+1. **✅ Metadata Schema Consolidation** - Merge copy_progress + copy_snapshots → copy_state
+2. **🔄 Batched LSN Updates** - Implement PeerDB-style checkpoint batching (100 commits/5s)
+3. **🔄 Monotonic LSN Progress** - Add GREATEST() pattern to prevent LSN regression
+4. **📋 S3 Pipeline Preparation** - Add sync_batch_id linking for future Redshift workers
+5. **📋 E2E Test Updates** - Validate consolidated metadata and reduced thrashing
+6. **📋 Configuration Updates** - Add checkpoint_batch_size and checkpoint_interval
+7. **📋 Unit Tests** - Test batching logic and metadata consolidation
 
 ### Key Architecture Decisions Made
 

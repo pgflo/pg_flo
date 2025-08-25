@@ -10,7 +10,7 @@ import (
 )
 
 // DirectReplicatorFactory creates DirectReplicator instances
-type DirectReplicatorFactory struct {
+type DirectReplicatorFactory struct { //nolint:revive // Clear namespacing needed
 	Config Config
 }
 
@@ -57,7 +57,7 @@ func (f *DirectReplicatorFactory) CreateReplicator(replicatorConfig replicator.C
 }
 
 // DirectReplicatorWrapper wraps DirectReplicator to implement replicator.Replicator interface
-type DirectReplicatorWrapper struct {
+type DirectReplicatorWrapper struct { //nolint:revive // Clear namespacing needed
 	directReplicator DirectReplicator
 }
 

@@ -8,7 +8,7 @@ import (
 )
 
 // DirectReplicator defines the interface for direct sink replication
-type DirectReplicator interface {
+type DirectReplicator interface { //nolint:revive // Clear namespacing needed
 	Bootstrap(ctx context.Context) error
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
@@ -20,30 +20,17 @@ type MetadataStore interface {
 	Close() error
 	EnsureSchema(ctx context.Context) error
 
-	// Table management
-	RegisterTables(ctx context.Context, groupName string, tables []TableInfo) error
-	GetUnassignedTables(ctx context.Context, groupName string, maxTables int) ([]TableAssignment, error)
-	AssignTables(ctx context.Context, workerID string, tableIDs []string) error
-	UpdateHeartbeat(ctx context.Context, workerID string) error
-
-	// Copy progress tracking
-	SaveCopyProgress(ctx context.Context, assignmentID string, lastPage uint32, totalPages uint32) error
-	GetCopyProgress(ctx context.Context, assignmentID string) (*CopyProgress, error)
-	MarkCopyComplete(ctx context.Context, assignmentID string) error
-
-	// Streaming progress
+	// Streaming progress tracking (essential for resumability)
 	SaveStreamingLSN(ctx context.Context, groupName string, lsn pglogrepl.LSN) error
 	GetStreamingLSN(ctx context.Context, groupName string) (pglogrepl.LSN, error)
-	GetLastLSN(ctx context.Context, assignmentID string) (pglogrepl.LSN, error)
-	UpdateStreamingLSN(ctx context.Context, assignmentID string, lsn pglogrepl.LSN) error
+	UpdateStreamingLSN(ctx context.Context, groupName string, lsn pglogrepl.LSN) error
+	UpdateStreamingLSNWithBatch(ctx context.Context, groupName string, lsn pglogrepl.LSN, batchID int64) error
 
-	// S3 file tracking
-	RecordS3File(ctx context.Context, filePath string, txID string, tableNames []string) error
-	MarkS3FileProcessed(ctx context.Context, filePath string) error
-
-	// CTID-based copy progress tracking
+	// Copy snapshot management (essential for copy/stream handoff)
 	SaveCopySnapshot(ctx context.Context, groupName, snapshotName, snapshotLSN string) error
 	GetCopySnapshot(ctx context.Context, groupName string) (string, string, error)
+
+	// CTID-based copy progress tracking (essential for resumability)
 	SaveCTIDCopyProgress(ctx context.Context, groupName, tableName, lastCTID string, bytesWritten int64, fileCount int, status string) error
 	GetCTIDCopyProgress(ctx context.Context, groupName, tableName string) (string, int64, int, string, error)
 	MarkCopyCompleted(ctx context.Context, groupName string) error

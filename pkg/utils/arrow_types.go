@@ -1,6 +1,10 @@
 package utils
 
 import (
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/apache/arrow/go/v15/arrow/memory"
@@ -51,6 +55,37 @@ func PostgresTypeToArrowType(pgTypeOID uint32) arrow.DataType {
 	default:
 		// Unknown types as strings for safety
 		return arrow.BinaryTypes.String
+	}
+}
+
+// BuildArrowArrayFromPostgresData builds Arrow array from PostgreSQL raw data
+func BuildArrowArrayFromPostgresData(pool memory.Allocator, dataType arrow.DataType, values [][]byte) arrow.Array {
+	switch dt := dataType.(type) {
+	case *arrow.BooleanType:
+		return buildBooleanArray(pool, values)
+	case *arrow.Int16Type:
+		return buildInt16Array(pool, values)
+	case *arrow.Int32Type:
+		return buildInt32Array(pool, values)
+	case *arrow.Int64Type:
+		return buildInt64Array(pool, values)
+	case *arrow.Float32Type:
+		return buildFloat32Array(pool, values)
+	case *arrow.Float64Type:
+		return buildFloat64Array(pool, values)
+	case *arrow.StringType:
+		return buildStringArray(pool, values)
+	case *arrow.BinaryType:
+		return buildBinaryArray(pool, values)
+	case *arrow.Date32Type:
+		return buildDate32Array(pool, values)
+	case *arrow.TimestampType:
+		return buildTimestampArray(pool, values, dt)
+	case *arrow.Time64Type:
+		return buildTime64Array(pool, values)
+	default:
+		// Fallback to string for unknown types
+		return buildStringArray(pool, values)
 	}
 }
 
@@ -151,4 +186,181 @@ func AppendValueToBuilder(builder array.Builder, value interface{}, _ uint32) {
 			builder.AppendNull()
 		}
 	}
+}
+
+// Helper functions for building specific Arrow array types from PostgreSQL data
+
+func buildBooleanArray(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewBooleanBuilder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else {
+			str := strings.TrimSpace(string(val))
+			builder.Append(str == "t" || str == "true" || str == "1")
+		}
+	}
+	return builder.NewBooleanArray()
+}
+
+func buildInt16Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewInt16Builder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if i, err := strconv.ParseInt(string(val), 10, 16); err == nil {
+			builder.Append(int16(i))
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewInt16Array()
+}
+
+func buildInt32Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewInt32Builder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if i, err := strconv.ParseInt(string(val), 10, 32); err == nil {
+			builder.Append(int32(i))
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewInt32Array()
+}
+
+func buildInt64Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewInt64Builder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if i, err := strconv.ParseInt(string(val), 10, 64); err == nil {
+			builder.Append(i)
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewInt64Array()
+}
+
+func buildFloat32Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewFloat32Builder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if f, err := strconv.ParseFloat(string(val), 32); err == nil {
+			builder.Append(float32(f))
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewFloat32Array()
+}
+
+func buildFloat64Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewFloat64Builder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if f, err := strconv.ParseFloat(string(val), 64); err == nil {
+			builder.Append(f)
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewFloat64Array()
+}
+
+func buildStringArray(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewStringBuilder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else {
+			builder.AppendString(string(val))
+		}
+	}
+	return builder.NewStringArray()
+}
+
+func buildBinaryArray(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else {
+			builder.Append(val)
+		}
+	}
+	return builder.NewBinaryArray()
+}
+
+func buildDate32Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewDate32Builder(pool)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if t, err := time.Parse("2006-01-02", string(val)); err == nil {
+			days := int32(t.Unix() / 86400) //nolint:gosec // Days calculation is safe
+			builder.Append(arrow.Date32(days))
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewDate32Array()
+}
+
+func buildTimestampArray(pool memory.Allocator, values [][]byte, timestampType *arrow.TimestampType) arrow.Array {
+	builder := array.NewTimestampBuilder(pool, timestampType)
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if t, err := time.Parse("2006-01-02 15:04:05", string(val)); err == nil {
+			builder.AppendTime(t)
+		} else if t, err := time.Parse(time.RFC3339, string(val)); err == nil {
+			builder.AppendTime(t)
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewTimestampArray()
+}
+
+func buildTime64Array(pool memory.Allocator, values [][]byte) arrow.Array {
+	builder := array.NewTime64Builder(pool, &arrow.Time64Type{Unit: arrow.Microsecond})
+	defer builder.Release()
+
+	for _, val := range values {
+		if val == nil {
+			builder.AppendNull()
+		} else if t, err := time.Parse("15:04:05", string(val)); err == nil {
+			micros := int64(t.Hour()*3600+t.Minute()*60+t.Second()) * 1000000
+			builder.Append(arrow.Time64(micros))
+		} else {
+			builder.AppendNull()
+		}
+	}
+	return builder.NewTime64Array()
 }
